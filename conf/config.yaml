@@ -9,4 +9,4 @@ defaults:
 #  - baseline: TFTD_SURF_timeseries_120_120
 # - baseline: Toy_experiment2
 # - baseline: ./Alibaba_time_machine/GRU.yaml
-- baseline: ./Alibaba_time_machine/CSDI_sg.yaml
+- baseline: ./Alibaba_time_machine/gd_diff.yaml

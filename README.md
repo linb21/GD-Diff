@@ -52,7 +52,7 @@ python main.py
 
 # Specify the configuration file and override parameters
 python main.py \
-  baseline=Alibaba_time_machine/CSDI_sg.yaml \
+  baseline=Alibaba_time_machine/gd_diff.yaml \
   baseline.training_config.device=cuda:0 \
   baseline.training_config.seed=2024 \
   baseline.seed=2024 \
@@ -60,9 +60,9 @@ python main.py \
 
 # Inference only: specify the path to a trained model
 python main.py \
-  baseline=Alibaba_time_machine/CSDI_sg.yaml \
+  baseline=Alibaba_time_machine/gd_diff.yaml \
   baseline.training_config.mode=pred \
-  baseline.training_config.model_path=./experiments/csdi_sg/Alibaba/xxx/best_model_0.pth
+  baseline.training_config.model_path=./experiments/gd_diff/Alibaba/xxx/best_model_0.pth
 ```
 
 ## Key Parameters
