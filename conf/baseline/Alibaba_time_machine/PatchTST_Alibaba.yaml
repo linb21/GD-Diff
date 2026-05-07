@@ -1,0 +1,127 @@
+model_name: patchtst
+trainer_name: CSDI_trainer
+config_path: 'conf/baseline/Alibaba_time_machine/PatchTST_Alibaba.yaml'
+root: './'
+seed: 2024 # 闅忔満鏁扮瀛?
+# training
+training_config:
+  seed: 2024 # 闅忔満鏁扮瀛?
+  des: 'test' # help='exp description'
+  device: "cuda:2" # 璁粌鎴栨帹鐞嗕娇鐢ㄧ殑GPU
+  is_training: true # 'pred'杩樻槸'train'
+  model_name: patchtst
+  data: 'SURF_Dataset'
+  # data_path: './datasets/ETTm1/data.pkl'
+  features: M
+  freq: 'h'
+  checkpoints: './result/patchtst/'
+
+  #task
+  task_name: 'long_term_forecast'
+  model_id: 'PatchTST_60_6'
+
+  #
+  enc_in: 101
+  dec_in: 101
+  c_out: 101
+  d_model: 128
+  e_layers: 1
+  d_layers: 1
+  d_ff: 256
+  moving_avg: 25
+  factor: 3
+  n_heads: 8
+  distil: True
+  label_len: 0
+
+  inverse: True
+  seasonal_patterns: 'Monthly' #help='subset for M4
+
+  num_workers: 10
+  itr: 1
+  train_epochs: 10
+  batch_size: 1
+  patience: 10
+  learning_rate: 0.001
+  loss: 'MSE'
+  lradj: 'type1'
+  use_amp: false
+
+  p_hidden_dims: [128, 128]
+  p_hidden_layers: 2
+  use_dtw: false
+
+  patch_len: 16
+  stride: 8
+
+  save_path: './experiments/patchtst/'
+  model_path: ''
+
+# data
+data_config:
+  is_non_stationary: False
+  dataset_name: SURF_Dataset
+  data_path: data/Alibaba/cpu_util_percent_selected_machines_100_1min_no_time_stamp.parquet
+  columns: ['all']
+  target_cols: ['all']
+  feature_cols_da: []
+  feature_cols_mask2D: []
+  feature_cols_mask1D: []
+  data_mode: 2
+  unit_len: 1
+  training_step: 1
+  past_len: 60
+  pred_len: 6
+  data_len:
+    end: "2024-11-19 23:45:00"
+    train: 366
+    valid: 32
+    test: 62
+    shift: 0
+  data_time:
+    train:
+      start: "2022-08-25 10:27:00"
+      end: "2022-10-01 11:07:30"
+    valid:
+      start: "2022-10-01 11:08:00"
+      end: "2022-10-06 18:04:30"
+    test:
+      start: "2022-10-06 18:05:00"
+      end: "2022-10-17 08:00:00"
+  train_val_test_ratio: [0.7, 0.1, 0.2]
+
+# model
+model_config:
+  model: PatchTST
+
+  dropout: 0.1
+  head_dropout: 0.1
+  padding_patch: 'end'
+  embed: 'timeF'
+  activation: 'gelu'
+  output_attention: False
+  channel_independence: 1
+  decomp_method: 'moving_avg'
+  use_norm: 1
+  down_sampling_layers: 0
+  down_sampling_window: 1
+  down_sampling_method: 'avg'
+  seg_len: 96
+
+  augmentation_ratio: 0
+  jitter: false
+  scaling: false
+  permutation: false
+  randompermutation: false
+  magwarp: false
+  timewarp: false
+  windowslice: false
+  windowwarp: false
+  rotation: false
+  spawner: false
+  dtwwarp: false
+  shapedtwwarp: false
+  wdba: false
+  discdtw: false
+  discsdtw: false
+  extra_tag: ""

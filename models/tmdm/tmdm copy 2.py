@@ -1,0 +1,801 @@
+from data_provider.data_factory import data_provider
+
+from models.tmdm.units.tools import EarlyStopping
+from models.tmdm.units.metrics import metric
+import pandas as pd
+from models.tmdm import ns_Transformer
+from models.tmdm import diffuMTS
+from models.tmdm.units.tmdm_utils import *
+from datetime import datetime
+import numpy as np
+import torch
+import torch.nn as nn
+from torch import optim
+import argparse
+import os
+import time
+import pytz
+from multiprocessing import Pool
+import CRPS.CRPS as pscore
+
+import warnings
+from tqdm import tqdm
+
+warnings.filterwarnings('ignore')
+
+
+def ccc(id, pred, true):
+    # print(id, datetime.datetime.now())
+    res_box = np.zeros(len(true))
+    for i in range(len(true)):
+        res = pscore(pred[i], true[i]).compute()
+        res_box[i] = res[0]
+    return res_box
+
+
+def log_normal(x, mu, var):
+    """Logarithm of normal distribution with mean=mu and variance=var
+       log(x|μ, σ^2) = loss = -0.5 * Σ log(2π) + log(σ^2) + ((x - μ)/σ)^2
+
+    Args:
+       x: (array) corresponding array containing the input
+       mu: (array) corresponding array containing the mean
+       var: (array) corresponding array containing the variance
+
+    Returns:
+       output: (array/float) depending on average parameters the result will be the mean
+                            of all the sample losses or an array with the losses per sample
+    """
+    eps = 1e-8
+    if eps > 0.0:
+        var = var + eps
+    # return -0.5 * torch.sum(
+    #     np.log(2.0 * np.pi) + torch.log(var) + torch.pow(x - mu, 2) / var)
+    return 0.5 * torch.mean(
+        np.log(2.0 * np.pi) + torch.log(var) + torch.pow(x - mu, 2) / var)
+
+class Exp_Basic(object):
+    def __init__(self, config):
+        config = self.preprocess_data(config)
+        self.configs=config
+        self.model_config=config['model_config']
+        self.training_config=config['training_config']
+        self.data_config=config['data_config']
+        # 合并所有配置项
+        merged_config = {**self.model_config, **self.training_config,**self.data_config}
+        def flatten_dict(d, parent_key=''):
+            items = {}
+            for k, v in d.items():
+                new_key = f"{parent_key}{k}" if parent_key else k
+                if isinstance(v, dict):
+                    items.update(flatten_dict(v, new_key + '_'))
+                else:
+                    items[new_key] = v
+            return items
+
+        merged_config = flatten_dict(merged_config)
+        self.args = argparse.Namespace(**merged_config)
+        if self.args.data=='Electricity_shanxi' or self.args.data=='Electricity_shandong':
+            self.args.past_len+=1
+        self.args.seq_len=self.args.past_len*self.args.unit_len
+        self.device = self._acquire_device()
+        model, cond_pred_model, cond_pred_model_train = self._build_model()
+        self.model = model.to(self.device)
+        self.cond_pred_model = cond_pred_model.to(self.device)
+        self.cond_pred_model_train = cond_pred_model_train.to(self.device)
+            # 显示模型参数量
+        print("\nModel Parameters:")
+        print("=" * 50)
+        
+        # 主扩散模型参数量
+        model_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Main Diffusion Model Parameters: {model_params:,}")
+        
+        # 条件预测模型参数量
+        cond_params = sum(p.numel() for p in self.cond_pred_model.parameters())
+        print(f"Conditional Model (inference) Parameters: {cond_params:,}")
+        
+        # 训练用条件预测模型参数量
+        cond_train_params = sum(p.numel() for p in self.cond_pred_model_train.parameters())
+        print(f"Conditional Model (training) Parameters: {cond_train_params:,}")
+        
+        # 总参数量
+        total_params = model_params + cond_params + cond_train_params
+        print("-" * 50)
+        print(f"Total Parameters: {total_params:,}")
+        print("=" * 50)
+    def _build_model(self):
+        raise NotImplementedError
+        return None, None, None
+    def preprocess_data(self, configs) -> None:
+        file_path = configs['data_config']["data_path"]
+        if file_path.endswith('.csv'):
+            raw_dataset = pd.read_csv(file_path)
+        elif file_path.endswith('.parquet'):
+            raw_dataset = pd.read_parquet(file_path)
+        elif file_path.endswith('.pkl') or file_path.endswith('.pickle'):
+            raw_dataset = pd.read_pickle(file_path)
+        else:
+            raise ValueError(f"Unsupported file format: {file_path}")
+        raw_dataset.set_index('timestamp',inplace=True)
+        raw_dataset.index = pd.to_datetime(raw_dataset.index)
+        if 'all' in configs['data_config']['target_cols']:
+            configs['data_config']['target_cols'] = raw_dataset.columns.tolist()
+            configs['data_config']['columns'] = raw_dataset.columns.tolist()
+            configs['target_dim'] = len(configs['data_config']['target_cols'])
+            configs['model_config']['real_target_dim'] = len(configs['data_config']['target_cols'])
+            configs['data_config']['feature_cols_mask2D'] = []
+            configs['data_config']['feature_cols_mask1D'] = []
+            configs['data_config']['feature_cols_da'] = []
+        else:
+            configs['model_config']['real_target_dim'] = len(configs['data_config']['target_cols'])
+        return configs
+    def _acquire_device(self):
+
+        device = torch.device(self.args.device)  # 直接使用 self.args.device
+        print(f"Use GPU: {self.args.device}")
+        # print(f"Available GPUs: {torch.cuda.device_count()}")
+        # if self.args.use_gpu:
+        #     os.environ["CUDA_VISIBLE_DEVICES"] = str(
+        #         self.args.gpu) if not self.args.use_multi_gpu else self.args.devices
+        #     device = torch.device('cuda:{}'.format(self.args.gpu))
+        #     print('Use GPU: cuda:{}'.format(self.args.gpu))
+        # else:
+        #     device = torch.device('cpu')
+        #     print('Use CPU')
+        return device
+
+    def _get_data(self):
+        pass
+
+    def vali(self):
+        pass
+
+    def train(self):
+        pass
+
+    def test(self):
+        pass
+
+
+class tmdm(Exp_Basic):
+    def __init__(self, config):
+        super(tmdm, self).__init__(config)
+
+        config = self.preprocess_data(config)
+        self.config = config
+        self.model_config=config['model_config']
+        self.training_config=config['training_config']
+        self.data_config=config['data_config']
+        # 合并所有配置项
+        merged_config = {**self.model_config, **self.training_config,**self.data_config}
+        def flatten_dict(d, parent_key=''):
+            items = {}
+            for k, v in d.items():
+                new_key = f"{parent_key}{k}" if parent_key else k
+                if isinstance(v, dict):
+                    items.update(flatten_dict(v, new_key + '_'))
+                else:
+                    items[new_key] = v
+            return items
+
+        merged_config = flatten_dict(merged_config)
+        self.args = argparse.Namespace(**merged_config)
+        #对于电价数据集，为了能够使用未来一天的日前特征，将原先的past_len推理pred_len修改为past_len+1推理pred_len，再在dataloader中进行相应的处理
+        if self.args.data=='Electricity_shanxi' or self.args.data=='Electricity_shandong':
+            self.args.past_len+=1
+        # 创建文件夹用于存储，文件夹名为 "数据集名字_时间"
+        beijing_tz = pytz.timezone("Asia/Shanghai")
+        current_time = (
+            datetime.now().astimezone(beijing_tz).strftime("%Y-%m-%d_%H:%M:%S")
+        )
+
+        foldername = (
+            self.config['training_config']["save_path"]
+            +  self.config['data_config']["data_path"].split("/")[-2] + "/"
+            + current_time
+            + "/"
+        )
+
+        print("model folder:", foldername)
+        foldername = os.path.join(config['root'], foldername)
+        os.makedirs(foldername, exist_ok=True)
+        self.foldername = foldername
+    def preprocess_data(self, configs) -> None:
+        file_path = configs['data_config']["data_path"]
+        if file_path.endswith('.csv'):
+            raw_dataset = pd.read_csv(file_path)
+        elif file_path.endswith('.parquet'):
+            raw_dataset = pd.read_parquet(file_path)
+        elif file_path.endswith('.pkl') or file_path.endswith('.pickle'):
+            raw_dataset = pd.read_pickle(file_path)
+        else:
+            raise ValueError(f"Unsupported file format: {file_path}")
+        raw_dataset.set_index('timestamp',inplace=True)
+        raw_dataset.index = pd.to_datetime(raw_dataset.index)
+        if 'all' in configs['data_config']['target_cols']:
+            configs['data_config']['target_cols'] = raw_dataset.columns.tolist()
+            configs['data_config']['columns'] = raw_dataset.columns.tolist()
+            configs['target_dim'] = len(configs['data_config']['target_cols'])
+            configs['model_config']['real_target_dim'] = len(configs['data_config']['target_cols'])
+            configs['data_config']['feature_cols_mask2D'] = []
+            configs['data_config']['feature_cols_mask1D'] = []
+            configs['data_config']['feature_cols_da'] = []
+        else:
+            configs['model_config']['real_target_dim'] = len(configs['data_config']['target_cols'])
+        return configs
+    def _build_model(self):
+        model = diffuMTS.Model(self.args, self.device).float()
+        # model = Transformer.Model(self.args).float()
+
+        cond_pred_model = ns_Transformer.Model(self.args).float()
+        cond_pred_model_train = ns_Transformer.Model(self.args).float()
+
+        # if self.args.use_multi_gpu and self.args.use_gpu:
+        #     model = nn.DataParallel(model, device_ids=self.args.device_ids)
+        #     cond_pred_model = nn.DataParallel(cond_pred_model, device_ids=self.args.device_ids)
+        #     cond_pred_model_train = nn.DataParallel(cond_pred_model_train, device_ids=self.args.device_ids)
+        return model, cond_pred_model, cond_pred_model_train
+
+    def _get_data(self, flag):
+        data_set, data_loader = data_provider(self.args, flag)
+        return data_set, data_loader
+
+    def _select_optimizer(self, mode='Model'):
+        if mode == 'Model':
+            # model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+            model_optim = optim.Adam([{'params': self.model.parameters()}, {'params': self.cond_pred_model.parameters()}],
+                                     lr=self.args.learning_rate)
+        elif mode == 'Cond':
+            model_optim = optim.Adam(self.cond_pred_model_train.parameters(), lr=self.args.learning_rate_Cond)
+        else:
+            model_optim = None
+        return model_optim
+
+    def _select_criterion(self):
+        criterion = nn.MSELoss()
+        return criterion
+
+    def vali(self, vali_data, vali_loader, criterion):
+        total_loss = []
+        self.model.eval()
+        self.cond_pred_model.eval()
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                # decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -int(self.args.pred_len*self.args.unit_len):, :]).float()
+                dec_inp = torch.cat([batch_y[:, :int(self.args.label_len*self.args.unit_len), :], dec_inp], dim=1).float().to(self.device)
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    if self.args.output_attention:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    else:
+                        n = batch_x.size(0)
+                        t = torch.randint(
+                            low=0, high=self.model.num_timesteps, size=(n // 2 + 1,)
+                        ).to(self.device)
+                        t = torch.cat([t, self.model.num_timesteps - 1 - t], dim=0)[:n]
+
+                        _, y_0_hat_batch, KL_loss, z_sample = self.cond_pred_model(batch_x, batch_x_mark, dec_inp,
+                                                                             batch_y_mark)
+                        f_dim = -1 if self.args.features == 'MS' else 0
+                        # f_dim=0
+                        # loss_vae = log_normal(batch_y[:,:,f_dim:], y_0_hat_batch[:,:,f_dim:], torch.from_numpy(np.array(1)))
+                        loss_vae = log_normal(batch_y[:,-self.args.pred_len*self.args.unit_len:,f_dim:], y_0_hat_batch[:,-self.args.pred_len*self.args.unit_len:,f_dim:], torch.from_numpy(np.array(1)))
+
+                        loss_vae_all = loss_vae + self.args.k_z * KL_loss
+                        # y_0_hat_batch = z_sample
+
+                        y_T_mean = y_0_hat_batch
+                        e = torch.randn_like(batch_y).to(self.device)
+
+                        y_t_batch = q_sample(batch_y, y_T_mean, self.model.alphas_bar_sqrt,
+                                             self.model.one_minus_alphas_bar_sqrt, t, config=self.args, noise=e)
+                        output = self.model(batch_x, batch_x_mark, batch_y, y_t_batch, y_0_hat_batch, t)
+                        f_dim = -1 if self.args.features == 'MS' else 0
+                        # f_dim=0
+                        output=output[:, -int(self.args.pred_len*self.args.unit_len):, f_dim:]
+                        e=e[:, -int(self.args.pred_len*self.args.unit_len):, f_dim:]
+                        loss = (e[:, -int(self.args.pred_len*self.args.unit_len):, :] - output[:, -int(self.args.pred_len*self.args.unit_len):, :]).square().mean() + self.args.k_cond * loss_vae_all
+                loss = loss.detach().cpu()
+
+                total_loss.append(loss)
+        total_loss = np.average(total_loss)
+        self.model.train()
+        return total_loss
+
+    def train(self):
+        train_data, train_loader = self._get_data(flag='train')
+        vali_data, vali_loader = self._get_data(flag='val')
+        test_data, test_loader = self._get_data(flag='test')
+        path=self.foldername
+        # path = os.path.join(self.args.checkpoints, setting)
+        # if not os.path.exists(path):
+        #     os.makedirs(path)
+
+        # if not os.path.exists(path):
+        #     os.makedirs(path)
+
+        # if not os.path.exists(path2):
+        #     os.makedirs(path2)
+
+        time_now = time.time()
+
+        train_steps = len(train_loader)
+        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
+
+
+        model_optim = self._select_optimizer()
+
+
+        criterion = self._select_criterion()
+
+        if self.args.use_amp:
+            scaler = torch.cuda.amp.GradScaler()
+
+        for epoch in range(self.args.train_epochs):
+
+            # Training the diffusion part
+            epoch_time = time.time()
+
+            iter_count = 0
+            train_loss = []
+            self.model.train()
+            self.cond_pred_model.train()
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+                iter_count += 1
+                model_optim.zero_grad()
+                batch_x = batch_x.float().to(self.device)
+
+                batch_y = batch_y.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                # decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -int(self.args.pred_len*self.args.unit_len):, :]).float()
+                dec_inp = torch.cat([batch_y[:, :int(self.args.label_len*self.args.unit_len), :], dec_inp], dim=1).float().to(self.device)
+
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                        f_dim = -1 if self.args.features == 'MS' else 0
+                        outputs = outputs[:, -int(self.args.pred_len*self.args.unit_len):, f_dim:]
+                        batch_y = batch_y[:, -int(self.args.pred_len*self.args.unit_len):, f_dim:].to(self.device)
+                        loss = criterion(outputs, batch_y)
+                        train_loss.append(loss.item())
+                else:
+                    if self.args.output_attention:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    else:
+                        n = batch_x.size(0)
+                        t = torch.randint(
+                            low=0, high=self.model.num_timesteps, size=(n // 2 + 1,)
+                        ).to(self.device)
+                        t = torch.cat([t, self.model.num_timesteps - 1 - t], dim=0)[:n]
+
+                        _, y_0_hat_batch, KL_loss, z_sample = self.cond_pred_model(batch_x, batch_x_mark, dec_inp,
+                                                                             batch_y_mark)
+                        f_dim = -1 if self.args.features == 'MS' else 0
+                        # f_dim=0
+                        loss_vae = log_normal(batch_y[:,-self.args.pred_len*self.args.unit_len:,f_dim:], y_0_hat_batch[:,-self.args.pred_len*self.args.unit_len:,f_dim:], torch.from_numpy(np.array(1)))
+
+                        loss_vae_all = loss_vae + self.args.k_z * KL_loss
+                        # y_0_hat_batch = z_sample
+
+                        y_T_mean = y_0_hat_batch
+                        e = torch.randn_like(batch_y).to(self.device)
+
+                        y_t_batch = q_sample(batch_y, y_T_mean, self.model.alphas_bar_sqrt,
+                                             self.model.one_minus_alphas_bar_sqrt, t, config=self.args, noise=e)
+
+                        output = self.model(batch_x, batch_x_mark, batch_y, y_t_batch, y_0_hat_batch, t)
+                        f_dim = -1 if self.args.features == 'MS' else 0
+                        e=e[:, :, f_dim:]
+                        output=output[:, :, f_dim:]
+
+                        # loss = (e[:, -self.args.pred_len:, :] - output[:, -self.args.pred_len:, :]).square().mean()
+                        loss = (e[:,-self.args.pred_len*self.args.unit_len:,:] - output[:,-self.args.pred_len*self.args.unit_len:,:]).square().mean() + self.args.k_cond*loss_vae_all
+
+                        train_loss.append(loss.item())
+
+                        if (i + 1) % 100 == 0:
+                            print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                            speed = (time.time() - time_now) / iter_count
+                            left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
+                            print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                            iter_count = 0
+                            time_now = time.time()
+
+                        if self.args.use_amp:
+                            scaler.scale(loss).backward()
+                            scaler.step(model_optim)
+                            scaler.update()
+                        else:
+                            loss.backward()
+                            model_optim.step()
+
+                        a = 0
+            print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+            train_loss = np.average(train_loss)
+            vali_loss = self.vali(vali_data, vali_loader, criterion)
+            test_loss = self.vali(test_data, test_loader, criterion)
+
+
+            print(
+                "Epoch: {0}, Steps: {1} | Train Loss: {2:.7f}  Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
+                    epoch + 1, train_steps, train_loss, vali_loss, test_loss))
+            early_stopping(vali_loss, self.model, path)
+
+            if (math.isnan(train_loss)):
+                break
+
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
+
+
+        best_model_path = path + '/' + 'best_model_0.pth'
+        self.model.load_state_dict(torch.load(best_model_path))
+
+        #训练结束执行测试,获取真实值和预测值
+        print('————————————————————————————testing——————————————————————')
+
+        self.test(test=0)
+
+        return self.model
+
+
+    def test(self, test=0):
+        #####################################################################################################
+        ########################## local functions within the class function scope ##########################
+
+        def store_gen_y_at_step_t(config, config_diff, idx, y_tile_seq, actual_batch_size):
+            """
+            Store generated y from a mini-batch to the array of corresponding time step.
+            
+            Args:
+                actual_batch_size: 实际batch大小（可能小于config.batch_size，特别是最后一个batch）
+            """
+            current_t = self.model.num_timesteps - idx
+            # 使用实际batch大小而不是config.batch_size，以处理最后一个不完整的batch
+            gen_y = y_tile_seq[idx].reshape(actual_batch_size,
+                                            int(config_diff.testing.n_z_samples / config_diff.testing.n_z_samples_depart),
+                                            (int(config.label_len*config.unit_len) + int(config.pred_len*config.unit_len)),
+                                            config.c_out).cpu().numpy()
+            # directly modify the dict value by concat np.array instead of append np.array gen_y to list
+            # reduces a huge amount of memory consumption
+            if len(gen_y_by_batch_list[current_t]) == 0:
+                gen_y_by_batch_list[current_t] = gen_y
+            else:
+                gen_y_by_batch_list[current_t] = np.concatenate([gen_y_by_batch_list[current_t], gen_y], axis=0)
+            return gen_y
+
+        def compute_true_coverage_by_gen_QI(config, dataset_object, all_true_y, all_generated_y):
+            n_bins = config.testing.n_bins
+            quantile_list = np.arange(n_bins + 1) * (100 / n_bins)
+            # compute generated y quantiles
+            y_pred_quantiles = np.percentile(all_generated_y.squeeze(), q=quantile_list, axis=1)
+            y_true = all_true_y.T
+            quantile_membership_array = ((y_true - y_pred_quantiles) > 0).astype(int)
+            y_true_quantile_membership = quantile_membership_array.sum(axis=0)
+            # y_true_quantile_bin_count = np.bincount(y_true_quantile_membership)
+            y_true_quantile_bin_count = np.array(
+                [(y_true_quantile_membership == v).sum() for v in np.arange(n_bins + 2)])
+
+            # combine true y falls outside of 0-100 gen y quantile to the first and last interval
+            y_true_quantile_bin_count[1] += y_true_quantile_bin_count[0]
+            y_true_quantile_bin_count[-2] += y_true_quantile_bin_count[-1]
+            y_true_quantile_bin_count_ = y_true_quantile_bin_count[1:-1]
+            # compute true y coverage ratio for each gen y quantile interval
+            # y_true_ratio_by_bin = y_true_quantile_bin_count_ / dataset_object.test_n_samples
+            y_true_ratio_by_bin = y_true_quantile_bin_count_ / dataset_object
+            assert np.abs(
+                np.sum(y_true_ratio_by_bin) - 1) < 1e-10, "Sum of quantile coverage ratios shall be 1!"
+            qice_coverage_ratio = np.absolute(np.ones(n_bins) / n_bins - y_true_ratio_by_bin).mean()
+            return y_true_ratio_by_bin, qice_coverage_ratio, y_true
+
+        def compute_PICP(config, y_true, all_gen_y, return_CI=False):
+            """
+            Another coverage metric.
+            """
+            low, high = config.testing.PICP_range
+            CI_y_pred = np.percentile(all_gen_y.squeeze(), q=[low, high], axis=1)
+            # compute percentage of true y in the range of credible interval
+            y_in_range = (y_true >= CI_y_pred[0]) & (y_true <= CI_y_pred[1])
+            coverage = y_in_range.mean()
+            if return_CI:
+                return coverage, CI_y_pred, low, high
+            else:
+                return coverage, low, high
+
+
+        if test:
+            print('loading model')
+            self.model.load_state_dict(torch.load(self.args.model_path))
+            # self.model.load_state_dict(torch.load(os.path.join(self.args.model_path, 'best_model.pth')))
+        test_data, test_loader = self._get_data(flag='test')
+        preds = []
+        trues = []
+        folder_path = self.foldername
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+        minibatch_sample_start = time.time()
+        self.model.eval()
+        self.cond_pred_model.eval()
+
+
+
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(tqdm(test_loader, desc='Testing', ncols=80)):
+                gen_y_by_batch_list = [[] for _ in range(self.model.num_timesteps + 1)]
+                y_se_by_batch_list = [[] for _ in range(self.model.num_timesteps + 1)]
+
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                # decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -int(self.args.pred_len*self.args.unit_len):, :]).float()
+                dec_inp = torch.cat([batch_y[:, :int(self.args.label_len*self.args.unit_len), :], dec_inp], dim=1).float().to(self.device)
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    if self.args.output_attention:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+
+                    else:
+
+                        _, y_0_hat_batch, _, z_sample = self.cond_pred_model(batch_x, batch_x_mark, dec_inp,
+                                                                             batch_y_mark)
+
+                        repeat_n = int(
+                            self.model.diffusion_config.testing.n_z_samples / self.model.diffusion_config.testing.n_z_samples_depart)
+                        y_0_hat_tile = y_0_hat_batch.repeat(repeat_n, 1, 1, 1)
+                        y_0_hat_tile = y_0_hat_tile.transpose(0, 1).flatten(0, 1).to(self.device)
+                        y_T_mean_tile = y_0_hat_tile
+                        x_tile = batch_x.repeat(repeat_n, 1, 1, 1)
+                        x_tile = x_tile.transpose(0, 1).flatten(0, 1).to(self.device)
+
+                        x_mark_tile = batch_x_mark.repeat(repeat_n, 1, 1, 1)
+                        x_mark_tile = x_mark_tile.transpose(0, 1).flatten(0, 1).to(self.device)
+
+                        gen_y_box = []
+                        # 获取实际batch大小（处理最后一个不完整的batch）
+                        actual_batch_size = batch_x.shape[0]
+                        # 用进度条查看采样循环的耗时
+                        for outer_idx in tqdm(
+                            range(self.model.diffusion_config.testing.n_z_samples_depart),
+                            desc="tmdm outer z-samples",
+                            leave=False
+                        ):
+                            for inner_idx in tqdm(
+                                range(self.model.diffusion_config.testing.n_z_samples_depart),
+                                desc="tmdm inner z-samples",
+                                leave=False
+                            ):
+                                y_tile_seq = p_sample_loop(
+                                    self.model,
+                                    x_tile,
+                                    x_mark_tile,
+                                    y_0_hat_tile,
+                                    y_T_mean_tile,
+                                    self.model.num_timesteps,
+                                    self.model.alphas,
+                                    self.model.one_minus_alphas_bar_sqrt,
+                                )
+
+                            gen_y = store_gen_y_at_step_t(
+                                config=self.model.args,
+                                config_diff=self.model.diffusion_config,
+                                idx=self.model.num_timesteps,
+                                y_tile_seq=y_tile_seq,
+                                actual_batch_size=actual_batch_size,
+                            )
+                            gen_y_box.append(gen_y)
+                        outputs = np.concatenate(gen_y_box, axis=1)
+
+                        f_dim = -1 if self.args.features == 'MS' else 0
+                        outputs = outputs[:, :, -int(self.args.pred_len*self.args.unit_len):, f_dim:]
+                        batch_y = batch_y[:, -int(self.args.pred_len*self.args.unit_len):, f_dim:].to(self.device)
+                        batch_y = batch_y.detach().cpu().numpy()
+
+                        pred = outputs  # outputs.detach().cpu().numpy()  # .squeeze()
+                        true = batch_y  # batch_y.detach().cpu().numpy()  # .squeeze()
+
+                        preds.append(pred)
+                        trues.append(true)
+
+                if i % 5 == 0 and i != 0:
+                    print('Testing: %d/%d cost time: %f min' % (
+                        i, len(test_loader), (time.time() - minibatch_sample_start) / 60))
+                    minibatch_sample_start = time.time()
+
+
+        preds = np.array(preds)
+        trues = np.array(trues)
+
+        preds_save = np.array(preds)
+        trues_save = np.array(trues)
+
+        preds_ns = np.array(preds).mean(axis=2)
+        print('test shape:', preds_ns.shape, trues.shape)
+        preds_ns = preds_ns.reshape(-1, preds_ns.shape[-2], preds_ns.shape[-1])
+        trues_ns = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
+        print('test shape before inverse:', preds_ns.shape, trues_ns.shape)
+        
+        # 完成去归一化（反归一化）- 参考timexer的实现
+        if test_data.scale and self.args.inverse:
+            # 获取原始特征维度
+            original_feature_dim = len(self.data_config['columns'])
+            # 如果是MS模式，先复制特征维度使其与scaler维度匹配
+            if self.args.features == 'MS':
+                preds_ns = np.tile(preds_ns, [1, 1, int(original_feature_dim / preds_ns.shape[-1])])
+                trues_ns = np.tile(trues_ns, [1, 1, int(original_feature_dim / trues_ns.shape[-1])])
+            # 将3D数据reshape成2D (batch*time, features)，进行反归一化，再reshape回原shape
+            shape_preds = preds_ns.shape
+            shape_trues = trues_ns.shape
+            preds_ns = test_data.inverse_transform(preds_ns.reshape(shape_preds[0] * shape_preds[1], -1)).reshape(shape_preds)
+            trues_ns = test_data.inverse_transform(trues_ns.reshape(shape_trues[0] * shape_trues[1], -1)).reshape(shape_trues)
+        
+        # 去归一化后，再筛选目标列
+        f_dim = -1 if self.args.features == 'MS' else 0
+        preds_ns = preds_ns[:, :, f_dim:]
+        trues_ns = trues_ns[:, :, f_dim:]
+        print('test shape after inverse:', preds_ns.shape, trues_ns.shape)
+
+        # result save
+        folder_path =self.foldername + '/'
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        mae, mse, rmse, mape, mspe = metric(preds_ns, trues_ns)
+        print('NT metrc: mse:{:.4f}, mae:{:.4f} , rmse:{:.4f}, mape:{:.4f}, mspe:{:.4f}'.format(mse, mae, rmse, mape,
+                                                                                                mspe))
+        preds = preds.reshape(-1, preds.shape[-3], preds.shape[-2] * preds.shape[-1])
+        preds = preds.transpose(0, 2, 1)
+        preds = preds.reshape(-1, preds.shape[-1])
+
+        trues = trues.reshape(-1, 1, trues.shape[-2] * trues.shape[-1])
+        trues = trues.transpose(0, 2, 1)
+        trues = trues.reshape(-1, trues.shape[-1])
+        y_true_ratio_by_bin, qice_coverage_ratio, y_true = compute_true_coverage_by_gen_QI(
+            config=self.model.diffusion_config, dataset_object=preds.shape[0],
+            all_true_y=trues, all_generated_y=preds, )
+
+        coverage, _, _ = compute_PICP(config=self.model.diffusion_config, y_true=y_true, all_gen_y=preds)
+
+        print('CARD metrc: QICE:{:.4f}%, PICP:{:.4f}%'.format(qice_coverage_ratio * 100, coverage * 100))
+
+        pred = preds_save.reshape(-1, preds_save.shape[-3], preds_save.shape[-2], preds_save.shape[-1])
+        true = trues_save.reshape(-1, trues_save.shape[-2], trues_save.shape[-1])
+
+        np.save(folder_path + 'metrics.npy',
+                np.array([mse, mae, rmse, mape, mspe, qice_coverage_ratio * 100, coverage * 100]))
+        np.save(folder_path + 'pred.npy', preds_save)
+        np.save(folder_path + 'true.npy', trues_save)
+
+        # np.save("./results/{}.npy".format(self.args.model_id), np.array(mse))
+
+        # np.save("./results/{}_Ntimes.npy".format(self.args.model_id),
+        #         np.array([mse, mae, rmse, mape, mspe, qice_coverage_ratio * 100, coverage * 100]))
+        # pool = Pool(processes=32)
+        # all_res = []
+        # for i in range(pred.shape[-1]):
+        #     p_in = pred[:, :, :, i]
+        #     p_in = p_in.transpose(0, 2, 1)
+        #     p_in = p_in.reshape(-1, p_in.shape[-1])
+        #     t_in = true[:, :, i]
+        #     t_in = t_in.reshape(-1)
+        #     # print(i)
+        #     all_res.append(pool.apply_async(ccc, args=(i, p_in, t_in)))
+        # p_in = np.sum(pred, axis=-1)
+        # p_in = p_in.transpose(0, 2, 1)
+        # p_in = p_in.reshape(-1, p_in.shape[-1])
+        # t_in = np.sum(true, axis=-1)
+        # t_in = t_in.reshape(-1)
+        # CRPS_sum = pool.apply_async(ccc, args=(8, p_in, t_in))
+
+        # pool.close()
+        # pool.join()
+
+        # all_res_get = []
+        # for i in range(len(all_res)):
+        #     all_res_get.append(all_res[i].get())
+        # all_res_get = np.array(all_res_get)
+
+        # CRPS_0 = np.mean(all_res_get, axis=0).mean()
+        # CRPS_sum = CRPS_sum.get()
+        # CRPS_sum = CRPS_sum.mean()
+
+        # print('CRPS', CRPS_0, 'CRPS_sum', CRPS_sum)
+
+        # f = open("result.txt", 'a')
+        # f.write(self.args.model_path + "  \n")
+        # f.write('mse:{}, mae:{}'.format(mse, mae))
+        # f.write('\n')
+        # f.write('\n')
+        # f.close()
+
+        # np.save(folder_path + 'metrics.npy',
+        #         np.array([mse, mae, rmse, mape, mspe, qice_coverage_ratio * 100, coverage * 100, CRPS_0, CRPS_sum]))
+        # np.save(folder_path + 'pred.npy', preds_save)
+        # np.save(folder_path + 'true.npy', trues_save)
+
+        # np.save("./results/{}.npy".format(self.args.model_id), np.array(mse))
+
+        # np.save("./results/{}_Ntimes.npy".format(self.args.model_id),
+        #         np.array([mse, mae, rmse, mape, mspe, qice_coverage_ratio * 100, coverage * 100, CRPS_0, CRPS_sum]))
+
+        return
+
+    def predict(self, setting, load=False):
+        pred_data, pred_loader = self._get_data(flag='pred')
+
+        if load:
+            path = os.path.join(self.args.checkpoints, setting)
+            best_model_path = path + '/' + 'checkpoint.pth'
+            self.model.load_state_dict(torch.load(best_model_path), map_location=self.device)
+
+        preds = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(pred_loader):
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float()
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                # decoder input
+                dec_inp = torch.zeros([batch_y.shape[0], int(self.args.pred_len*self.args.unit_len), batch_y.shape[2]]).float()
+                dec_inp = torch.cat([batch_y[:, :int(self.args.label_len*self.args.unit_len), :], dec_inp], dim=1).float().to(self.device)
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    if self.args.output_attention:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    else:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                pred = outputs.detach().cpu().numpy()  # .squeeze()
+                preds.append(pred)
+
+        preds = np.array(preds)
+        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
+
+        # result save
+        folder_path = './results/' + setting + '/'
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        np.save(folder_path + 'real_prediction.npy', preds)
+
+        return

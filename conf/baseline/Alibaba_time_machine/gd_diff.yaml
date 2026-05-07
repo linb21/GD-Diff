@@ -1,0 +1,122 @@
+model_name: gd_diff
+trainer_name: CSDI_trainer
+config_path: 'conf/baseline/Alibaba_time_machine/gd_diff.yaml'
+seed: 2024 # 随机数种子
+# training
+training_config:
+  seed: 2024 # 随机数种子
+  device: "cuda:5" # 训练或推理使用的GPU
+  mode: "pred" # 'pred'还是'train'
+  save_path: './experiments/gd_diff/'
+  model_path: '' # 如果不为空，则直接加载模型进行推理，否则进行训练
+  # v1
+  # 60->6 
+  # model_path: 'logs/Alibaba_time_graph_architecture/gategcn_6_minute/best_model_0.pth' # 如果不为空，则直接加载模型进行推理，否则进行训练
+  # 60->30
+  # model_path: './experiments/csdi/Alibaba/2026-01-11_00:28:47/best_model_0.pth' # 如果不为空，则直接加载模型进行推理，否则进行训练
+  # ./experiments/csdi/Alibaba/2026-01-10_09:28:26/best_model_0.pth
+  # v2
+  # model_path: './experiments/csdi/Alibaba/2026-01-13_00:22:22/best_model_0.pth'
+  # model_path: './experiments/csdi/Alibaba/2026-01-12_16:08:29/best_model_0.pth'
+
+  # v6
+  # model_path: './experiments/csdi/Alibaba/2026-01-13_00:51:28/best_model_0.pth'
+  # v7
+  # model_path: './experiments/csdi/Alibaba/2026-01-14_18:46:20/best_model_0.pth'
+  # model_path: './experiments/csdi/Alibaba/2026-01-14_18:46:28/best_model_0.pth'
+  valid_nsample: 3 # 推理验证集时产生的样本曲线数
+  epochs: 100
+  patience: 20 # 训练轮次
+  batch_size: 4 # 单批次样本数目
+  itr_per_epoch: 1.0e+8
+  lr: 1.0e-3 # 初始学习率
+  p1: 15 # 学习率第一次调整轮次
+  p2: 20 # 学习率第二次调整轮次
+  lr_gamma: 0.1 # 学习率调整比例
+  finetune:
+    epochs: 5
+    batch_size: 16
+    lr: 1.0e-3
+    p1: 0.75
+    p2: 0.9
+    lr_gamma: 0.1
+  roll_run: 0 # 定义额外滚动测试次数，为0时即为不进行滚动测试，只测试一次
+  roll_step: 7 # 定义滚动测试的平移长度为多少个unit_len
+  inverse: True #输出结果是否去归一化
+
+
+# data
+data_config:
+  is_non_stationary: True # 决定是否要进行非平稳时间序列的训练，1的话则进行归一化
+  non_stationary_type: 1 # 归一化类型：0-仅去中心化，1-标准化
+  dataset_name: SURF_Dataset
+  data_path: ./data/Alibaba/cpu_util_percent_selected_machines_100_1min_no_time_stamp.parquet # 数据所在位置
+  # for static graph
+  graph_path: ./data/Alibaba/static_adjacency_graph_100.npy
+  # for time graph
+  # graph_dir: ./data/Alibaba/random_graph_minute/
+  graph_dir: ./data/Alibaba/minute_graph/step4_node100_spread_normalized/
+  # graph_dir: ./data/Alibaba/random_graph/
+  columns: ['all'] # 确定取数据中哪些列及其相对位置
+  target_cols: ['all'] # 目标列名
+  feature_cols_da: [] # 辅助变量，日前
+  feature_cols_mask2D: [] # 辅助变量，日内
+  feature_cols_mask1D: [] # 辅助变量，日内
+  data_mode: 2 # 0的话就是使用数据长度切割数据，1的话就是使用时间切割数据
+  unit_len: 1 # 一天的数据序列长度
+  training_step: 1 # 训练时偏移的步长
+  past_len: 60 # 历史窗长，多少个unit_len
+  pred_len: 6 # 预测长度，多少个unit_len
+  data_len: # data_mode为0
+    end: "2024-11-19 23:45:00" # 确定数据集的终止时间
+    train: 366 # 训练集长度，多少个unit_len，-1时为剩余的全部数据
+    valid: 32 # 验证集长度，多少个unit_len
+    test: 62 # 测试集长度，多少个unit_len
+    shift: 0 # 相较于数据末尾的向前偏移量，多少个unit_len
+  data_time: # data_mode为1
+    train: # 训练集
+      start: "2018-01-01 00:00:00"
+      end: "2018-01-01 12:00:00"
+    valid: # 验证集
+      start: "2018-01-01 01:00:00"
+      end: "2018-01-01 02:00:00"
+    test: # 测试集
+      start: "2018-01-01 02:00:00"
+      end: "2018-01-01 02:30:00"
+  train_val_test_ratio: [0.7, 0.1, 0.2] #data_mode为2
+  # train_val_test_ratio: [0.7, 0.2, 0.1] #data_mode为2
+# model
+model_config:
+
+  nsample: 100 # 推理时产生的样本曲线数
+  version: 1 # 模型版本
+  is_finetune: 0 # 决定是否要进行微调训练
+  real_time_emb: 1 # 决定是否要使用真实时间戳进行编码
+  
+  diffusion:
+    layers: 5
+    channels: 64 
+    nheads: 8
+    diffusion_embedding_dim: 128
+    beta_start: 0.0001
+    beta_end: 0.5
+    num_steps: 50
+    schedule: "quad"
+    is_linear: False
+    real_time_emb_dim: 16 # 决定真实时间戳的维度
+  model:
+    is_unconditional: 0
+    timeemb: 128
+    featureemb: 16
+    target_strategy: "test"
+    num_sample_features: 256
+  graph:
+    version: 4
+    order_version: 7
+    graph_architecture: "gategcn" # avwgcn or gcn
+    graph_type: "sg" # None or sg or static
+    graph_freq: 'minute' # 1d or 1h or 10min or 1min
+    num_nodes: 100
+    embed_dim: 16
+    cheb_k: 2
+    top_k: 10
