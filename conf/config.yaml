@@ -1,12 +1,2 @@
 defaults:
-#  - baseline: csdi_SURF_timeseries_fasttest
-#  - baseline: diffusion_ja_SURF_timeseries_fasttest
-#  - baseline: diffusion_mr_SURF_timeseries_120_12
-# - baseline: diffusion_ja_SURF_timeseries_120_12
-#  - baseline: csdi_SURF_timeseries_120_12
-#  - baseline: TimeMixer_SURF_r28n4_120_12
-#  - baseline: FEDformer_SURF_r28n4_120_120
-#  - baseline: TFTD_SURF_timeseries_120_120
-# - baseline: Toy_experiment2
-# - baseline: ./Alibaba_time_machine/GRU.yaml
-- baseline: ./Alibaba_time_machine/gd_diff.yaml
+  - baseline: ./Alibaba_time_machine/gd_diff.yaml

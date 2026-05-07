@@ -1,29 +1,25 @@
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-from linear_attention_transformer import LinearAttentionTransformer
-from models.gd_diff.graph_layer import AVWGCN
+
 from models.gd_diff.graph_layer import GatedDynamicGCN
+
+
 def get_torch_trans(heads=8, layers=1, channels=64):
     encoder_layer = nn.TransformerEncoderLayer(
-        d_model=channels, nhead=heads, dim_feedforward=64, activation="gelu",batch_first=True
+        d_model=channels,
+        nhead=heads,
+        dim_feedforward=64,
+        activation="gelu",
+        batch_first=True,
     )
     return nn.TransformerEncoder(encoder_layer, num_layers=layers)
 
-def get_linear_trans(heads=8,layers=1,channels=64,localheads=0,localwindow=0):
 
-  return LinearAttentionTransformer(
-        dim = channels,
-        depth = layers,
-        heads = heads,
-        max_seq_len = 256,
-        n_local_attn_heads = 0, 
-        local_attn_window_size = 0,
-    )
-
-def Conv1d_with_init(in_channels, out_channels, kernel_size):
+def conv1d_with_init(in_channels, out_channels, kernel_size):
     layer = nn.Conv1d(in_channels, out_channels, kernel_size)
     nn.init.kaiming_normal_(layer.weight)
     return layer
@@ -36,7 +32,7 @@ class DiffusionEmbedding(nn.Module):
             projection_dim = embedding_dim
         self.register_buffer(
             "embedding",
-            self._build_embedding(num_steps, embedding_dim / 2),
+            self._build_embedding(num_steps, embedding_dim // 2),
             persistent=False,
         )
         self.projection1 = nn.Linear(embedding_dim, projection_dim)
@@ -44,45 +40,110 @@ class DiffusionEmbedding(nn.Module):
 
     def forward(self, diffusion_step):
         x = self.embedding[diffusion_step]
-        x = self.projection1(x)
-        x = F.silu(x)
-        x = self.projection2(x)
-        x = F.silu(x)
+        x = F.silu(self.projection1(x))
+        x = F.silu(self.projection2(x))
         return x
 
-    def _build_embedding(self, num_steps, dim=64):
-        steps = torch.arange(num_steps).unsqueeze(1)  # (T,1)
-        frequencies = 10.0 ** (torch.arange(dim) / (dim - 1) * 4.0).unsqueeze(0)  # (1,dim)
-        table = steps * frequencies  # (T,dim)
-        table = torch.cat([torch.sin(table), torch.cos(table)], dim=1)  # (T,dim*2)
-        return table
+    def _build_embedding(self, num_steps, dim):
+        steps = torch.arange(num_steps).unsqueeze(1)
+        frequencies = 10.0 ** (torch.arange(dim) / max(dim - 1, 1) * 4.0).unsqueeze(0)
+        table = steps * frequencies
+        return torch.cat([torch.sin(table), torch.cos(table)], dim=1)
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, graph_config, side_dim, channels, diffusion_embedding_dim, nheads):
+        super().__init__()
+        self.graph_type = graph_config["graph_type"]
+        self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
+        self.cond_projection = conv1d_with_init(side_dim, 2 * channels, 1)
+        self.mid_projection = conv1d_with_init(channels, 2 * channels, 1)
+        self.output_projection = conv1d_with_init(channels, 2 * channels, 1)
+        self.time_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
+        self.graph_layer = GatedDynamicGCN(channels, channels, graph_config["top_k"])
+        self.mix_gate = nn.Linear(channels, 1)
+
+    def forward_time(self, y, base_shape):
+        batch_size, channels, num_nodes, seq_len = base_shape
+        if seq_len == 1:
+            return y
+
+        y = y.reshape(batch_size, channels, num_nodes, seq_len)
+        y = y.permute(0, 2, 3, 1).reshape(batch_size * num_nodes, seq_len, channels)
+        y = self.time_layer(y)
+        y = y.reshape(batch_size, num_nodes, seq_len, channels)
+        y = y.permute(0, 3, 1, 2).reshape(batch_size, channels, num_nodes * seq_len)
+        return y
+
+    def forward_graph(self, y, base_shape, graph):
+        batch_size, channels, num_nodes, seq_len = base_shape
+        y = y.reshape(batch_size, channels, num_nodes, seq_len)
+        y = y.permute(0, 3, 2, 1)
+        y = self.graph_layer(y, graph)
+        y = y.permute(0, 3, 2, 1).reshape(batch_size, channels, num_nodes * seq_len)
+        return y
+
+    def forward(self, x, cond_info, diffusion_emb, graph):
+        batch_size, channels, num_nodes, seq_len = x.shape
+        base_shape = x.shape
+        x = x.reshape(batch_size, channels, num_nodes * seq_len)
+
+        diffusion_emb = self.diffusion_projection(diffusion_emb).unsqueeze(-1)
+        y = x + diffusion_emb
+
+        temporal_branch = self.forward_time(y, base_shape)
+        graph_branch = self.forward_graph(y, base_shape, graph)
+
+        combined = temporal_branch + graph_branch
+        gate = torch.sigmoid(
+            self.mix_gate(combined.permute(0, 2, 1).reshape(batch_size * num_nodes * seq_len, channels))
+        ).reshape(batch_size, 1, num_nodes * seq_len)
+        y = gate * temporal_branch + (1.0 - gate) * graph_branch
+        y = self.mid_projection(y)
+
+        _, cond_dim, _, _ = cond_info.shape
+        cond_info = cond_info.reshape(batch_size, cond_dim, num_nodes * seq_len)
+        y = y + self.cond_projection(cond_info)
+
+        gate_part, filter_part = torch.chunk(y, 2, dim=1)
+        y = torch.sigmoid(gate_part) * torch.tanh(filter_part)
+        y = self.output_projection(y)
+
+        residual, skip = torch.chunk(y, 2, dim=1)
+        residual = residual.reshape(base_shape)
+        skip = skip.reshape(base_shape)
+        x = x.reshape(base_shape)
+        return (x + residual) / math.sqrt(2.0), skip
 
 
 class diff_CSDI(nn.Module):
-    def __init__(self, config, graph_config, inputdim=2,side_dim=None):
+    def __init__(self, config, graph_config, inputdim=2, side_dim=None):
         super().__init__()
         self.channels = config["channels"]
         self.real_time_emb_dim = config.get("real_time_emb_dim", 0)
+        self.graph_type = graph_config["graph_type"]
         self.diffusion_embedding = DiffusionEmbedding(
             num_steps=config["num_steps"],
             embedding_dim=config["diffusion_embedding_dim"],
         )
-        self.all_channels = self.channels+self.real_time_emb_dim
-        self.input_projection = Conv1d_with_init(inputdim, self.channels, 1)
-        self.output_projection1 = Conv1d_with_init(self.all_channels, self.all_channels, 1)
-        self.output_projection2 = Conv1d_with_init(self.all_channels, 1, 1)
+        self.all_channels = self.channels + self.real_time_emb_dim
+        self.input_projection = conv1d_with_init(inputdim, self.channels, 1)
+        self.output_projection1 = conv1d_with_init(self.all_channels, self.all_channels, 1)
+        self.output_projection2 = conv1d_with_init(self.all_channels, 1, 1)
         nn.init.zeros_(self.output_projection2.weight)
-        if graph_config['graph_type']=='sg' or graph_config['graph_type']=='static' or graph_config['graph_type']=='time':
-            self.node_embeddings = nn.Parameter(torch.randn(
-                graph_config['num_nodes'], graph_config['embed_dim']), requires_grad=True)
+
+        if self.graph_type == "sg":
+            self.node_embeddings = nn.Parameter(
+                torch.randn(graph_config["num_nodes"], graph_config["embed_dim"]),
+                requires_grad=True,
+            )
         else:
             self.node_embeddings = None
+
         if self.real_time_emb_dim > 0:
-            # self.day_embedding = nn.Embedding(32, self.real_time_emb_dim)
             self.hour_embedding = nn.Embedding(24, self.real_time_emb_dim)
-            # self.minute_embedding = nn.Embedding(60, self.real_time_emb_dim)
         else:
-            self.time_embedding = None
+            self.hour_embedding = None
 
         self.residual_layers = nn.ModuleList(
             [
@@ -92,163 +153,55 @@ class diff_CSDI(nn.Module):
                     channels=self.all_channels,
                     diffusion_embedding_dim=config["diffusion_embedding_dim"],
                     nheads=config["nheads"],
-                    is_linear=config["is_linear"],
                 )
                 for _ in range(config["layers"])
             ]
         )
 
-    def forward(self, x, cond_info, diffusion_step, graph=None,real_time_embed=None):
-        B, inputdim, K, L = x.shape
+    def _build_graph(self, batch_size, seq_len, device, graph):
+        if self.graph_type == "sg":
+            learned_graph = F.softmax(
+                F.relu(torch.matmul(self.node_embeddings, self.node_embeddings.transpose(0, 1))),
+                dim=-1,
+            )
+            return learned_graph.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1, -1).to(device)
+        if self.graph_type == "time":
+            if graph is None:
+                raise ValueError("Time-varying graph input is required when graph_type='time'.")
+            return graph.to(device)
+        if self.graph_type == "static":
+            if graph is None:
+                raise ValueError("Static graph input is required when graph_type='static'.")
+            return graph.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1, -1).to(device)
+        raise ValueError(f"Unsupported graph_type: {self.graph_type}")
 
-        x = x.reshape(B, inputdim, K * L)
-        x = self.input_projection(x)
-        x = F.relu(x)
-        x = x.reshape(B, self.channels, K, L)
+    def forward(self, x, cond_info, diffusion_step, graph=None, real_time_embed=None):
+        batch_size, inputdim, num_nodes, seq_len = x.shape
 
-        if real_time_embed is not None:
-            # day = real_time_embed[:, 0, :].long()  # (B, L)
-            hour = real_time_embed[:, 1, :].long()  # (B, L)
-            # minute = real_time_embed[:, 2, :].long()  # (B, L)
-            hour_emb = self.hour_embedding(hour)  # (B, L, real_time_emb_dim)
-            # minute_emb = self.minute_embedding(minute)  # (B, L, real_time_emb_dim)
-            hour_emb = hour_emb.permute(0, 2, 1)  # (B, real_time_emb_dim, L)
-            hour_emb = hour_emb.unsqueeze(2).expand(-1, -1, K, -1)  # (B, real_time_emb_dim, K, L)
-            # minute_emb = minute_emb.permute(0, 2, 1)  # (B, real_time_emb_dim, L)
-            # minute_emb = minute_emb.unsqueeze(2).expand(-1, -1, K, -1)  # (B, real_time_emb_dim, K, L)
-            x = torch.cat([x, hour_emb], dim=1)  # (B, self.channels + real_time_emb_dim, K, L)
+        x = x.reshape(batch_size, inputdim, num_nodes * seq_len)
+        x = F.relu(self.input_projection(x))
+        x = x.reshape(batch_size, self.channels, num_nodes, seq_len)
 
+        if real_time_embed is not None and self.hour_embedding is not None:
+            hour = real_time_embed[:, 1, :].long()
+            hour_emb = self.hour_embedding(hour).permute(0, 2, 1)
+            hour_emb = hour_emb.unsqueeze(2).expand(-1, -1, num_nodes, -1)
+            x = torch.cat([x, hour_emb], dim=1)
+
+        graph = self._build_graph(batch_size, seq_len, x.device, graph)
         diffusion_emb = self.diffusion_embedding(diffusion_step)
 
-        skip = []
+        skip_connections = []
         for layer in self.residual_layers:
-            x, skip_connection = layer(x, cond_info, diffusion_emb, graph,self.node_embeddings)
-            skip.append(skip_connection)
+            x, skip = layer(x, cond_info, diffusion_emb, graph)
+            skip_connections.append(skip)
 
-        x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))
-        x = x.reshape(B, self.all_channels, K * L)
-        x = self.output_projection1(x)  # (B,channel,K*L)
-        x = F.relu(x)
-        x = self.output_projection2(x)  # (B,1,K*L)
-        x = x.reshape(B, K, L)
-        return x
+        x = torch.sum(torch.stack(skip_connections), dim=0) / math.sqrt(len(skip_connections))
+        x = x.reshape(batch_size, self.all_channels, num_nodes * seq_len)
+        x = F.relu(self.output_projection1(x))
+        x = self.output_projection2(x)
+        return x.reshape(batch_size, num_nodes, seq_len)
 
-
-class ResidualBlock(nn.Module):
-    def __init__(self, graph_config, side_dim, channels, diffusion_embedding_dim, nheads, is_linear=False):
-        super().__init__()
-        self.graph_config = graph_config
-        self.graph_type = graph_config['graph_type']
-        self.graph_architecture = graph_config['graph_architecture']
-        self.top_k = graph_config['top_k']
-        self.order_version = graph_config['order_version']
-        self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
-        self.cond_projection = Conv1d_with_init(side_dim, 2 * channels, 1)
-        if self.order_version==6:
-            self.mid_projection = Conv1d_with_init(2*channels, 2 * channels, 1)
-        else:
-            self.mid_projection = Conv1d_with_init(channels, 2 * channels, 1)
-        self.output_projection = Conv1d_with_init(channels, 2 * channels, 1)
-
-        self.branch_weight = nn.Parameter(torch.tensor(0.5))
-        # self.branch_weight = 0.5
-        self.gate = nn.Linear(channels, 1)
-        self.is_linear = is_linear
-        if graph_config['graph_type']=='None':
-            if is_linear:
-                self.time_layer = get_linear_trans(heads=nheads,layers=1,channels=channels)
-                self.feature_layer = get_linear_trans(heads=nheads,layers=1,channels=channels)
-            else:
-                self.time_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
-                self.feature_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
-        else:
-            if is_linear:
-                self.time_layer = get_linear_trans(heads=nheads,layers=1,channels=channels)
-                self.feature_layer1 = get_linear_trans(heads=nheads,layers=1,channels=channels)
-            else:
-                self.time_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
-                self.feature_layer = get_torch_trans(heads=nheads, layers=1, channels=channels)
-            if self.graph_architecture == 'avwgcn':
-                self.graph_layer = AVWGCN(channels, channels, graph_config['cheb_k'], graph_config['embed_dim'],graph_config['graph_type'],graph_config['version'],self.top_k)
-            elif self.graph_architecture == 'gategcn':
-                self.graph_layer = GatedDynamicGCN(channels, channels, self.top_k)
-
-
-    def forward_time(self, y, base_shape):
-        B, channel, K, L = base_shape
-        if L == 1:
-            return y
-        y = y.reshape(B, channel, K, L).permute(0, 2, 1, 3).reshape(B * K, channel, L)
-
-        if self.is_linear:
-            y = self.time_layer(y.permute(0, 2, 1)).permute(0, 2, 1)
-        else:
-            y = self.time_layer(y.permute(0, 2, 1)).permute(0, 2, 1)
-        y = y.reshape(B, K, channel, L).permute(0, 2, 1, 3).reshape(B, channel, K * L)
-        return y
-
-
-    def forward_feature(self, y, base_shape):
-        B, channel, K, L = base_shape
-        if K == 1:
-            return y
-        y = y.reshape(B, channel, K, L).permute(0, 3, 1, 2).reshape(B * L, channel, K)
-        if self.is_linear:
-            y = self.feature_layer(y.permute(0, 2, 1)).permute(0, 2, 1)
-        else:
-            y = self.feature_layer(y.permute(0, 2, 1)).permute(0, 2, 1)
-        y = y.reshape(B, L, channel, K).permute(0, 2, 3, 1).reshape(B, channel, K * L)
-        return y
-    def forward_sg(self, y, base_shape, node_embeddings, graph):
-        B, channel, K, L = base_shape
-        y=y.reshape(B, channel, K ,L)
-        y=y.permute(0,2,1,3)  # [B, K, channel, L] = [B, N, C, T]
-
-        
-        if self.graph_architecture == 'avwgcn' :
-            y = y.permute(0, 3, 1, 2).reshape(B * L, K, channel)  # [B*L, K, channel] = [B*T, N, C]
-            y = self.graph_layer(y, node_embeddings, graph)  # [B*L, K, channel] = [B*T, N, dim_out]
-            y = y.reshape(B, L, K, -1).permute(0, 2, 3, 1)  # [B, K, channel, L] = [B, N, dim_out, T]
-            y=y.permute(0,2,1,3).reshape(B, channel, K * L)  # [B, channel, K, L] -> [B, channel, K*L]
-        elif self.graph_architecture == 'gategcn':
-            y = y.permute(0, 3, 1, 2)  # [B*L, K, channel] = [B,T, N, C]
-            y = self.graph_layer(y, graph)  # [B, T, N, channel] = [B, T, N, channel]
-            y = y.permute(0, 2, 3, 1)  # [B, T, N, channel] = [B, N, channel, T]
-            y=y.permute(0,2,1,3).reshape(B, channel, K * L)  # [B, channel, N, L] -> [B, channel, K*L]
-
-        return y
-    def forward(self, x, cond_info, diffusion_emb, graph=None,node_embeddings=None):
-        B, channel, K, L = x.shape
-        base_shape = x.shape
-        x = x.reshape(B, channel, K * L)
-
-        diffusion_emb = self.diffusion_projection(diffusion_emb).unsqueeze(-1)  # (B,channel,1)
-        y = x + diffusion_emb
-
-        % graph-conditioned dual branch
-        y_graph=self.forward_sg(y,base_shape, node_embeddings, graph)
-        y = self.forward_time(y, base_shape)
-        combined = y + y_graph  # (B, channel, K*L)
-        B, channel, KL = combined.shape
-        gate = self.gate(combined.permute(0, 2, 1).reshape(B * KL, channel))  # (B*K*L, 1)
-        gate = torch.sigmoid(gate).reshape(B, 1, KL)  #  [0,1]
-        y = gate * y + (1 - gate) * y_graph  # (B, channel, K*L)
-        y = self.mid_projection(y)  # (B,2*channel,K*L)
-
-        _, cond_dim, _, _ = cond_info.shape
-        cond_info = cond_info.reshape(B, cond_dim, K * L)
-        cond_info = self.cond_projection(cond_info)  # (B,2*channel,K*L)
-        y = y + cond_info
-
-        gate, filter = torch.chunk(y, 2, dim=1)
-        y = torch.sigmoid(gate) * torch.tanh(filter)  # (B,channel,K*L)
-        y = self.output_projection(y)
-
-        residual, skip = torch.chunk(y, 2, dim=1)
-        x = x.reshape(base_shape)
-        residual = residual.reshape(base_shape)
-        skip = skip.reshape(base_shape)
-        return (x + residual) / math.sqrt(2.0), skip
 
 class CSDI_base(nn.Module):
     def __init__(self, target_dim, config, device):
@@ -256,168 +209,123 @@ class CSDI_base(nn.Module):
         self.device = device
         self.target_dim = target_dim
 
-        self.emb_time_dim = config["model_config"]['model']['timeemb']
-        self.emb_feature_dim = config["model_config"]['model']['featureemb']
-        self.is_unconditional = config["model_config"]['model']['is_unconditional']
-        self.target_strategy = config["model_config"]['model']['target_strategy']
-        self.real_time_emb=config["model_config"].get('real_time_emb', 0)
+        model_cfg = config["model_config"]["model"]
+        diffusion_cfg = config["model_config"]["diffusion"]
+        graph_cfg = config["model_config"]["graph"]
+
+        self.emb_time_dim = model_cfg["timeemb"]
+        self.emb_feature_dim = model_cfg["featureemb"]
+        self.is_unconditional = model_cfg["is_unconditional"]
+        self.real_time_emb = config["model_config"].get("real_time_emb", 0)
+
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
-        if self.is_unconditional == False:
-            self.emb_total_dim += 1  # for conditional mask
-        self.embed_layer = nn.Embedding(
-            num_embeddings=self.target_dim, embedding_dim=self.emb_feature_dim
-        )
-        config["model_config"]["diffusion"]
-        config_diff = config["model_config"]["diffusion"]
-        config_graph = config["model_config"]["graph"]
-        # config_diff["side_dim"] = self.emb_total_dim
+        if not self.is_unconditional:
+            self.emb_total_dim += 1
 
-        input_dim = 1 if self.is_unconditional == True else 2
-        self.diffmodel = diff_CSDI(config_diff, config_graph, input_dim,self.emb_total_dim)
+        self.embed_layer = nn.Embedding(target_dim, self.emb_feature_dim)
+        input_dim = 1 if self.is_unconditional else 2
+        self.diffmodel = diff_CSDI(diffusion_cfg, graph_cfg, input_dim, self.emb_total_dim)
 
-        # parameters for diffusion models
-        self.num_steps = config_diff["num_steps"]
-        if config_diff["schedule"] == "quad":
+        self.num_steps = diffusion_cfg["num_steps"]
+        if diffusion_cfg["schedule"] == "quad":
             self.beta = np.linspace(
-                config_diff["beta_start"] ** 0.5, config_diff["beta_end"] ** 0.5, self.num_steps
+                diffusion_cfg["beta_start"] ** 0.5,
+                diffusion_cfg["beta_end"] ** 0.5,
+                self.num_steps,
             ) ** 2
-        elif config_diff["schedule"] == "linear":
+        else:
             self.beta = np.linspace(
-                config_diff["beta_start"], config_diff["beta_end"], self.num_steps
+                diffusion_cfg["beta_start"],
+                diffusion_cfg["beta_end"],
+                self.num_steps,
             )
-
         self.alpha_hat = 1 - self.beta
         self.alpha = np.cumprod(self.alpha_hat)
-        self.alpha_torch = torch.tensor(self.alpha).float().to(self.device).unsqueeze(1).unsqueeze(1)
-
-    def time_embedding(self, pos, d_model=128):
-        pe = torch.zeros(pos.shape[0], pos.shape[1], d_model).to(self.device)
-        position = pos.unsqueeze(2)
-        div_term = 1 / torch.pow(
-            10000.0, torch.arange(0, d_model, 2).to(self.device) / d_model
+        self.alpha_torch = (
+            torch.tensor(self.alpha).float().to(self.device).unsqueeze(1).unsqueeze(1)
         )
+
+    def time_embedding(self, pos, d_model):
+        pe = torch.zeros(pos.shape[0], pos.shape[1], d_model, device=self.device)
+        position = pos.unsqueeze(2)
+        div_term = 1 / torch.pow(10000.0, torch.arange(0, d_model, 2, device=self.device) / d_model)
         pe[:, :, 0::2] = torch.sin(position * div_term)
         pe[:, :, 1::2] = torch.cos(position * div_term)
         return pe
 
-    def get_randmask(self, observed_mask):
-        rand_for_mask = torch.rand_like(observed_mask) * observed_mask
-        rand_for_mask = rand_for_mask.reshape(len(rand_for_mask), -1)
-        for i in range(len(observed_mask)):
-            sample_ratio = np.random.rand()  # missing ratio
-            num_observed = observed_mask[i].sum().item()
-            num_masked = round(num_observed * sample_ratio)
-            rand_for_mask[i][rand_for_mask[i].topk(num_masked).indices] = -1
-        cond_mask = (rand_for_mask > 0).reshape(observed_mask.shape).float()
-        return cond_mask
+    def get_side_info(self, observed_tp, cond_mask, feature_id=None):
+        batch_size, num_nodes, seq_len = cond_mask.shape
+        time_embed = self.time_embedding(observed_tp, self.emb_time_dim)
+        time_embed = time_embed.unsqueeze(2).expand(-1, -1, num_nodes, -1)
 
-    def get_hist_mask(self, observed_mask, for_pattern_mask=None):
-        if for_pattern_mask is None:
-            for_pattern_mask = observed_mask
-        if self.target_strategy == "mix":
-            rand_mask = self.get_randmask(observed_mask)
+        if feature_id is None:
+            feature_embed = self.embed_layer(torch.arange(num_nodes, device=self.device))
+            feature_embed = feature_embed.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1, -1)
+        else:
+            feature_embed = self.embed_layer(feature_id).unsqueeze(1).expand(-1, seq_len, -1, -1)
 
-        cond_mask = observed_mask.clone()
-        for i in range(len(cond_mask)):
-            mask_choice = np.random.rand()
-            if self.target_strategy == "mix" and mask_choice > 0.5:
-                cond_mask[i] = rand_mask[i]
-            else:  # draw another sample for histmask (i-1 corresponds to another sample)
-                cond_mask[i] = cond_mask[i] * for_pattern_mask[i - 1] 
-        return cond_mask
-
-    def get_test_pattern_mask(self, observed_mask, test_pattern_mask):
-        return observed_mask * test_pattern_mask
-
-
-    def get_side_info(self, observed_tp, cond_mask):
-        B, K, L = cond_mask.shape
-
-        time_embed = self.time_embedding(observed_tp, self.emb_time_dim)  # (B,L,emb)
-        time_embed = time_embed.unsqueeze(2).expand(-1, -1, K, -1)
-        feature_embed = self.embed_layer(
-            torch.arange(self.target_dim).to(self.device)
-        )  # (K,emb)
-        feature_embed = feature_embed.unsqueeze(0).unsqueeze(0).expand(B, L, -1, -1)
-
-        side_info = torch.cat([time_embed, feature_embed], dim=-1)  # (B,L,K,*)
-        side_info = side_info.permute(0, 3, 2, 1)  # (B,*,K,L)
-
-        if self.is_unconditional == False:
-            side_mask = cond_mask.unsqueeze(1)  # (B,1,K,L)
-            side_info = torch.cat([side_info, side_mask], dim=1)
-
+        side_info = torch.cat([time_embed, feature_embed], dim=-1).permute(0, 3, 2, 1)
+        if not self.is_unconditional:
+            side_info = torch.cat([side_info, cond_mask.unsqueeze(1)], dim=1)
         return side_info
 
-    def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train
-    ):
-        loss_sum = 0
-        for t in range(self.num_steps):  # calculate loss for all t
-            loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t
-            )
-            loss_sum += loss.detach()
-        return loss_sum / self.num_steps
+    def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
+        if self.is_unconditional:
+            return noisy_data.unsqueeze(1)
+        cond_obs = (cond_mask * observed_data).unsqueeze(1)
+        noisy_target = ((1 - cond_mask) * noisy_data).unsqueeze(1)
+        return torch.cat([cond_obs, noisy_target], dim=1)
 
-    def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, set_t=-1, graph=None,real_time_embed=None
-    ):
-        B, K, L = observed_data.shape
-        if is_train != 1:  # for validation
-            t = (torch.ones(B) * set_t).long().to(self.device)
+    def calc_loss(self, observed_data, cond_mask, observed_mask, side_info, graph, real_time_embed, set_t=-1, is_train=1):
+        batch_size = observed_data.shape[0]
+        if is_train == 1:
+            t = torch.randint(0, self.num_steps, [batch_size], device=self.device)
         else:
-            t = torch.randint(0, self.num_steps, [B]).to(self.device)
-        current_alpha = self.alpha_torch[t]  # (B,1,1)
+            t = torch.full((batch_size,), set_t, device=self.device, dtype=torch.long)
+
+        current_alpha = self.alpha_torch[t]
         noise = torch.randn_like(observed_data)
-        noisy_data = (current_alpha ** 0.5) * observed_data + (1.0 - current_alpha) ** 0.5 * noise
-
+        noisy_data = current_alpha.sqrt() * observed_data + (1.0 - current_alpha).sqrt() * noise
         total_input = self.set_input_to_diffmodel(noisy_data, observed_data, cond_mask)
-
-        predicted = self.diffmodel(total_input, side_info, t, graph=graph,real_time_embed=real_time_embed)  # (B,K,L)
+        predicted = self.diffmodel(total_input, side_info, t, graph=graph, real_time_embed=real_time_embed)
 
         target_mask = observed_mask - cond_mask
         residual = (noise - predicted) * target_mask
         num_eval = target_mask.sum()
-        loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
-        return loss
+        return (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
 
-    def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
-        if self.is_unconditional == True:
-            total_input = noisy_data.unsqueeze(1)  # (B,1,K,L)
-        else:
-            cond_obs = (cond_mask * observed_data).unsqueeze(1)
-            noisy_target = ((1 - cond_mask) * noisy_data).unsqueeze(1)
-            total_input = torch.cat([cond_obs, noisy_target], dim=1)  # (B,2,K,L)
+    def calc_loss_valid(self, observed_data, cond_mask, observed_mask, side_info, graph, real_time_embed):
+        loss_sum = 0
+        for t in range(self.num_steps):
+            loss_sum += self.calc_loss(
+                observed_data,
+                cond_mask,
+                observed_mask,
+                side_info,
+                graph,
+                real_time_embed,
+                set_t=t,
+                is_train=0,
+            ).detach()
+        return loss_sum / self.num_steps
 
-        return total_input
+    def impute(self, observed_data, cond_mask, side_info, n_samples, graph, real_time_embed):
+        batch_size, num_nodes, seq_len = observed_data.shape
+        imputed_samples = torch.zeros(batch_size, n_samples, num_nodes, seq_len, device=self.device)
 
-    def impute(self, observed_data, cond_mask, side_info, n_samples, graph=None,real_time_embed=None):
-        B, K, L = observed_data.shape
-
-        imputed_samples = torch.zeros(B, n_samples, K, L).to(self.device)
-
-        for i in range(n_samples):
-            # generate noisy observation for unconditional model
-            if self.is_unconditional == True:
-                noisy_obs = observed_data
-                noisy_cond_history = []
-                for t in range(self.num_steps):
-                    noise = torch.randn_like(noisy_obs)
-                    noisy_obs = (self.alpha_hat[t] ** 0.5) * noisy_obs + self.beta[t] ** 0.5 * noise
-                    noisy_cond_history.append(noisy_obs * cond_mask)
-
+        for sample_idx in range(n_samples):
             current_sample = torch.randn_like(observed_data)
-
             for t in range(self.num_steps - 1, -1, -1):
-                if self.is_unconditional == True:
-                    diff_input = cond_mask * noisy_cond_history[t] + (1.0 - cond_mask) * current_sample
-                    diff_input = diff_input.unsqueeze(1)  # (B,1,K,L)
-                else:
-                    cond_obs = (cond_mask * observed_data).unsqueeze(1)
-                    noisy_target = ((1 - cond_mask) * current_sample).unsqueeze(1)
-                    diff_input = torch.cat([cond_obs, noisy_target], dim=1)  # (B,2,K,L)
-                predicted = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), graph=graph,real_time_embed=real_time_embed)
+                cond_obs = (cond_mask * observed_data).unsqueeze(1)
+                noisy_target = ((1 - cond_mask) * current_sample).unsqueeze(1)
+                diff_input = torch.cat([cond_obs, noisy_target], dim=1)
+                predicted = self.diffmodel(
+                    diff_input,
+                    side_info,
+                    torch.tensor([t], device=self.device),
+                    graph=graph,
+                    real_time_embed=real_time_embed,
+                )
 
                 coeff1 = 1 / self.alpha_hat[t] ** 0.5
                 coeff2 = (1 - self.alpha_hat[t]) / (1 - self.alpha[t]) ** 0.5
@@ -425,203 +333,94 @@ class CSDI_base(nn.Module):
 
                 if t > 0:
                     noise = torch.randn_like(current_sample)
-                    sigma = (
-                        (1.0 - self.alpha[t - 1]) / (1.0 - self.alpha[t]) * self.beta[t]
-                    ) ** 0.5
-                    current_sample += sigma * noise
+                    sigma = ((1.0 - self.alpha[t - 1]) / (1.0 - self.alpha[t]) * self.beta[t]) ** 0.5
+                    current_sample = current_sample + sigma * noise
 
-            imputed_samples[:, i] = current_sample.detach()
+            imputed_samples[:, sample_idx] = current_sample.detach()
+
         return imputed_samples
-
-    def forward(self, batch, is_train=1):
-        (
-            observed_data,
-            observed_mask,
-            observed_tp,
-            gt_mask,
-            for_pattern_mask,
-            _,
-        ) = self.process_data(batch)
-        if is_train == 0:
-            cond_mask = gt_mask
-        elif self.target_strategy != "random":
-            cond_mask = self.get_hist_mask(
-                observed_mask, for_pattern_mask=for_pattern_mask
-            )
-        else:
-            cond_mask = self.get_randmask(observed_mask)
-
-        side_info = self.get_side_info(observed_tp, cond_mask)
-
-        loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
-
-        return loss_func(observed_data, cond_mask, observed_mask, side_info, is_train)
-
-    def evaluate(self, batch, n_samples):
-        (
-            observed_data,
-            observed_mask,
-            observed_tp,
-            gt_mask,
-            _,
-            cut_length,
-        ) = self.process_data(batch)
-
-        with torch.no_grad():
-            cond_mask = gt_mask
-            target_mask = observed_mask - cond_mask
-
-            side_info = self.get_side_info(observed_tp, cond_mask)
-
-            samples = self.impute(observed_data, cond_mask, side_info, n_samples)
-
-            for i in range(len(cut_length)):  # to avoid double evaluation
-                target_mask[i, ..., 0 : cut_length[i].item()] = 0
-        return samples, observed_data, target_mask, observed_mask, observed_tp
-
-
 
 
 class Forecasting(CSDI_base):
     def __init__(self, config, device, target_dim):
-        super(Forecasting, self).__init__(target_dim, config, device)
+        super().__init__(target_dim, config, device)
         self.target_dim_base = target_dim
-        self.num_sample_features = config['model_config']["model"]["num_sample_features"]
+        self.num_sample_features = config["model_config"]["model"]["num_sample_features"]
 
     def process_data(self, batch):
-        observed_data = batch["observed_data"].to(self.device).float()
-        observed_mask = batch["observed_mask"].to(self.device).float()
+        observed_data = batch["observed_data"].to(self.device).float().permute(0, 2, 1)
+        observed_mask = batch["observed_mask"].to(self.device).float().permute(0, 2, 1)
         observed_tp = batch["timepoints"].to(self.device).float()
-        gt_mask = batch["gt_mask"].to(self.device).float()
+        gt_mask = batch["gt_mask"].to(self.device).float().permute(0, 2, 1)
+        feature_id = torch.arange(self.target_dim_base, device=self.device).unsqueeze(0).expand(observed_data.shape[0], -1)
 
-        observed_data = observed_data.permute(0, 2, 1)
-        observed_mask = observed_mask.permute(0, 2, 1)
-        gt_mask = gt_mask.permute(0, 2, 1)
+        graph = batch.get("graph")
+        if graph is not None:
+            graph = graph.to(self.device).float()
 
-        cut_length = torch.zeros(len(observed_data)).long().to(self.device)
-        for_pattern_mask = observed_mask
-
-        feature_id=torch.arange(self.target_dim_base).unsqueeze(0).expand(observed_data.shape[0],-1).to(self.device)
-        graph = batch.get("graph", None)
-        if self.real_time_emb!=0:
-            day = batch.get("day", None)
-            hour = batch.get("hour", None)
-            minute = batch.get("minute", None)
-            real_time_embed = torch.stack([day, hour, minute], dim=1).to(self.device)
+        if self.real_time_emb:
+            real_time_embed = torch.stack(
+                [
+                    batch["day"].to(self.device),
+                    batch["hour"].to(self.device),
+                    batch["minute"].to(self.device),
+                ],
+                dim=1,
+            )
         else:
             real_time_embed = None
-        if graph is not None:
-            # graph = graph.mean(dim=0)  # (N, N)
-            graph=graph.to(self.device).float()
-        return (
-            observed_data,
-            observed_mask,
-            observed_tp,
-            gt_mask,
-            for_pattern_mask,
-            cut_length,
-            feature_id, 
-            graph,
-            real_time_embed,
-        )        
 
-    def sample_features(self,observed_data, observed_mask,feature_id,gt_mask):
-        size = self.num_sample_features
-        self.target_dim = size
+        return observed_data, observed_mask, observed_tp, gt_mask, feature_id, graph, real_time_embed
+
+    def sample_features(self, observed_data, observed_mask, feature_id, gt_mask):
+        sample_size = self.num_sample_features
+        self.target_dim = sample_size
         extracted_data = []
         extracted_mask = []
         extracted_feature_id = []
         extracted_gt_mask = []
-        
-        for k in range(len(observed_data)):
-            ind = np.arange(self.target_dim_base)
-            np.random.shuffle(ind)
-            extracted_data.append(observed_data[k,ind[:size]])
-            extracted_mask.append(observed_mask[k,ind[:size]])
-            extracted_feature_id.append(feature_id[k,ind[:size]])
-            extracted_gt_mask.append(gt_mask[k,ind[:size]])
-        extracted_data = torch.stack(extracted_data,0)
-        extracted_mask = torch.stack(extracted_mask,0)
-        extracted_feature_id = torch.stack(extracted_feature_id,0)
-        extracted_gt_mask = torch.stack(extracted_gt_mask,0)
-        return extracted_data, extracted_mask,extracted_feature_id, extracted_gt_mask
 
+        for idx in range(len(observed_data)):
+            indices = np.arange(self.target_dim_base)
+            np.random.shuffle(indices)
+            indices = indices[:sample_size]
+            extracted_data.append(observed_data[idx, indices])
+            extracted_mask.append(observed_mask[idx, indices])
+            extracted_feature_id.append(feature_id[idx, indices])
+            extracted_gt_mask.append(gt_mask[idx, indices])
 
-    def get_side_info(self, observed_tp, cond_mask,feature_id=None):
-        B, K, L = cond_mask.shape
-
-        time_embed = self.time_embedding(observed_tp, self.emb_time_dim)  # (B,L,emb)
-        time_embed = time_embed.unsqueeze(2).expand(-1, -1, self.target_dim, -1)
-
-        if self.target_dim == self.target_dim_base:
-            feature_embed = self.embed_layer(
-                torch.arange(self.target_dim).to(self.device)
-            )  # (K,emb)
-            feature_embed = feature_embed.unsqueeze(0).unsqueeze(0).expand(B, L, -1, -1)
-        else:
-            feature_embed = self.embed_layer(feature_id).unsqueeze(1).expand(-1,L,-1,-1)
-        side_info = torch.cat([time_embed, feature_embed], dim=-1)  # (B,L,K,*)
-        side_info = side_info.permute(0, 3, 2, 1)  # (B,*,K,L)
-
-        if self.is_unconditional == False:
-            side_mask = cond_mask.unsqueeze(1)  # (B,1,K,L)
-            side_info = torch.cat([side_info, side_mask], dim=1)
-
-        return side_info
+        return (
+            torch.stack(extracted_data, 0),
+            torch.stack(extracted_mask, 0),
+            torch.stack(extracted_feature_id, 0),
+            torch.stack(extracted_gt_mask, 0),
+        )
 
     def forward(self, batch, is_train=1):
-        (
-            observed_data,
-            observed_mask,
-            observed_tp,
-            gt_mask,
-            _,
-            _,
-            feature_id, 
-            graph,
-            real_time_embed,
-        ) = self.process_data(batch)
-        if is_train == 1 and (self.target_dim_base > self.num_sample_features):
-            observed_data, observed_mask,feature_id,gt_mask = \
-                    self.sample_features(observed_data, observed_mask,feature_id,gt_mask)
+        observed_data, observed_mask, observed_tp, gt_mask, feature_id, graph, real_time_embed = self.process_data(batch)
+
+        if is_train == 1 and self.target_dim_base > self.num_sample_features:
+            observed_data, observed_mask, feature_id, gt_mask = self.sample_features(
+                observed_data, observed_mask, feature_id, gt_mask
+            )
         else:
             self.target_dim = self.target_dim_base
             feature_id = None
 
-        if is_train == 0:
-            cond_mask = gt_mask
-        else: #test pattern
-            cond_mask = self.get_test_pattern_mask(
-                observed_mask, gt_mask
-            )
-
+        cond_mask = gt_mask
         side_info = self.get_side_info(observed_tp, cond_mask, feature_id)
 
-        loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
-
-        return loss_func(observed_data, cond_mask, observed_mask, side_info, is_train, graph=graph,real_time_embed=real_time_embed)
-
-
+        if is_train == 1:
+            return self.calc_loss(observed_data, cond_mask, observed_mask, side_info, graph, real_time_embed, is_train=1)
+        return self.calc_loss_valid(observed_data, cond_mask, observed_mask, side_info, graph, real_time_embed)
 
     def evaluate(self, batch, n_samples):
-        (
-            observed_data,
-            observed_mask,
-            observed_tp,
-            gt_mask,
-            _,
-            _,
-            feature_id, 
-            graph,
-            real_time_embed,
-        ) = self.process_data(batch)
+        observed_data, observed_mask, observed_tp, gt_mask, _, graph, real_time_embed = self.process_data(batch)
+        cond_mask = gt_mask
+        target_mask = observed_mask * (1 - gt_mask)
+        side_info = self.get_side_info(observed_tp, cond_mask)
 
         with torch.no_grad():
-            cond_mask = gt_mask
-            target_mask = observed_mask * (1-gt_mask)
-
-            side_info = self.get_side_info(observed_tp, cond_mask)
-
-            samples = self.impute(observed_data, cond_mask, side_info, n_samples,graph=graph,real_time_embed=real_time_embed)
+            samples = self.impute(observed_data, cond_mask, side_info, n_samples, graph, real_time_embed)
 
         return samples, observed_data, target_mask, observed_mask, observed_tp
