@@ -4,31 +4,34 @@ A graph-enhanced diffusion framework for multivariate time-series forecasting, w
 
 ## Project Structure
 
-├── main.py # Entry file
-├── conf/
-│ ├── config.yaml # Main configuration file specifying the default baseline
-│ └── baseline/ # YAML configurations for different models and datasets
-│ ├── Alibaba_time_machine/
-│ ├── GoogleCluster_time_machine/
-│ └── ...
-├── models/ # Model implementations
-│ ├── gd_diff/ # GD-Diff: the proposed model
-│ ├── CSDI/ # CSDI baseline
-│ ├── D3U/ # D3U
-│ ├── TMDM/ # TMDM
-│ ├── TimeMixer/ # TimeMixer
-│ ├── timefilter/ # TimeFilter
-│ └── ...
-├── Trainer/ # Trainers
-│ ├── CSDI_trainer.py # Trainer for diffusion-based models
-│ ├── MTS_trainer.py # Trainer for multivariate time-series models
-│ └── UTS_trainer.py # Trainer for univariate time-series models
-├── data_provider/ # Data loading modules
-│ ├── csdi_dataloader.py # Data loader for CSDI-style diffusion models
-│ └── TS_Dataset.py # General time-series dataset
-└── utils/
-├── metrics.py # Evaluation metrics
-└── scaler.py # Normalization utilities
+```text
+.
+|-- main.py                      # Entry file
+|-- conf/
+|   |-- config.yaml              # Main configuration file specifying the default baseline
+|   `-- baseline/                # YAML configurations for different models and datasets
+|       |-- Alibaba_time_machine/
+|       |-- GoogleCluster_time_machine/
+|       `-- ...
+|-- models/                      # Model implementations
+|   |-- gd_diff/                 # GD-Diff: the proposed model
+|   |-- CSDI/                    # CSDI baseline
+|   |-- D3U/                     # D3U
+|   |-- TMDM/                    # TMDM
+|   |-- TimeMixer/               # TimeMixer
+|   |-- timefilter/              # TimeFilter
+|   `-- ...
+|-- Trainer/                     # Trainers
+|   |-- CSDI_trainer.py          # Trainer for diffusion-based models
+|   |-- MTS_trainer.py           # Trainer for multivariate time-series models
+|   `-- UTS_trainer.py           # Trainer for univariate time-series models
+|-- data_provider/               # Data loading modules
+|   |-- csdi_dataloader.py       # Data loader for CSDI-style diffusion models
+|   `-- TS_Dataset.py            # General time-series dataset
+`-- utils/
+    |-- metrics.py               # Evaluation metrics
+    `-- scaler.py                # Normalization utilities
+```
 
 ## Quick Start
 
@@ -49,7 +52,7 @@ python main.py
 
 # Specify the configuration file and override parameters
 python main.py \
-  baseline=Alibaba_time_machine/gd_diff.yaml \
+  baseline=Alibaba_time_machine/CSDI_sg.yaml \
   baseline.training_config.device=cuda:0 \
   baseline.training_config.seed=2024 \
   baseline.seed=2024 \
@@ -57,9 +60,9 @@ python main.py \
 
 # Inference only: specify the path to a trained model
 python main.py \
-  baseline=Alibaba_time_machine/gd_diff.yaml \
+  baseline=Alibaba_time_machine/CSDI_sg.yaml \
   baseline.training_config.mode=pred \
-  baseline.training_config.model_path=./experiments/gd_diff/Alibaba/xxx/best_model_0.pth
+  baseline.training_config.model_path=./experiments/csdi_sg/Alibaba/xxx/best_model_0.pth
 ```
 
 ## Key Parameters
@@ -93,7 +96,7 @@ python main.py \
 | Parameter                  | Description                                    | Default Value |
 | -------------------------- | ---------------------------------------------- | ------------- |
 | `nsample`                  | Number of samples during inference             | `100`         |
-| `diffusion.layers`         | Number of layers in the denoising network      | `5`           |
+| `diffusion.layers`         | Number of layers in the denoising network      | `4`           |
 | `diffusion.channels`       | Number of hidden channels                      | `64`          |
 | `diffusion.num_steps`      | Number of diffusion steps                      | `50`          |
 | `graph.graph_type`         | Graph type: `time` / `sg` / `None`             | `time`        |
@@ -158,7 +161,3 @@ The framework supports the following evaluation metrics:
 - **Spearman**: Spearman rank correlation coefficient
 
 During inference, the median of the generated samples, namely the 50th percentile, is used as the point prediction.
-
-```
-
-```
