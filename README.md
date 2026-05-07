@@ -12,7 +12,7 @@ A graph-enhanced diffusion framework for multivariate time-series forecasting, w
 │ ├── GoogleCluster_time_machine/
 │ └── ...
 ├── models/ # Model implementations
-│ ├── CSDI_sg/ # GD-Diff: the proposed model
+│ ├── gd_diff/ # GD-Diff: the proposed model
 │ ├── CSDI/ # CSDI baseline
 │ ├── D3U/ # D3U
 │ ├── TMDM/ # TMDM
@@ -49,7 +49,7 @@ python main.py
 
 # Specify the configuration file and override parameters
 python main.py \
-  baseline=Alibaba_time_machine/CSDI_sg.yaml \
+  baseline=Alibaba_time_machine/gd_diff.yaml \
   baseline.training_config.device=cuda:0 \
   baseline.training_config.seed=2024 \
   baseline.seed=2024 \
@@ -57,9 +57,9 @@ python main.py \
 
 # Inference only: specify the path to a trained model
 python main.py \
-  baseline=Alibaba_time_machine/CSDI_sg.yaml \
+  baseline=Alibaba_time_machine/gd_diff.yaml \
   baseline.training_config.mode=pred \
-  baseline.training_config.model_path=./experiments/csdi_sg/Alibaba/xxx/best_model_0.pth
+  baseline.training_config.model_path=./experiments/gd_diff/Alibaba/xxx/best_model_0.pth
 ```
 
 ## Key Parameters
@@ -93,7 +93,7 @@ python main.py \
 | Parameter                  | Description                                    | Default Value |
 | -------------------------- | ---------------------------------------------- | ------------- |
 | `nsample`                  | Number of samples during inference             | `100`         |
-| `diffusion.layers`         | Number of layers in the denoising network      | `4`           |
+| `diffusion.layers`         | Number of layers in the denoising network      | `5`           |
 | `diffusion.channels`       | Number of hidden channels                      | `64`          |
 | `diffusion.num_steps`      | Number of diffusion steps                      | `50`          |
 | `graph.graph_type`         | Graph type: `time` / `sg` / `None`             | `time`        |
