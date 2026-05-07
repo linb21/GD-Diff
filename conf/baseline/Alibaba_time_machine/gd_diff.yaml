@@ -59,7 +59,7 @@ model_config:
     num_sample_features: 256
 
   graph:
-    graph_type: sg
+    graph_type: 'time'
     num_nodes: 100
     embed_dim: 16
     top_k: 10
