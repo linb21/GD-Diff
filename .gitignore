@@ -6,7 +6,6 @@ data/*
 venv/
 ENV/
 env/
-job_timeline_frames/*
 experiments/*
 logs/*
 *.tmp
