@@ -77,10 +77,7 @@ class diff_CSDI(nn.Module):
                 graph_config['num_nodes'], graph_config['embed_dim']), requires_grad=True)
         else:
             self.node_embeddings = None
-        # 时间编码层：将day、hour、minute组合成一个索引进行共同编码
         if self.real_time_emb_dim > 0:
-            # day: 0-31 (32个值), hour: 0-23 (24个值), minute: 0-59 (60个值)
-            # 组合索引：day * 24 * 60 + hour * 60 + minute，总共 32 * 24 * 60 = 46080 种组合
             # self.day_embedding = nn.Embedding(32, self.real_time_emb_dim)
             self.hour_embedding = nn.Embedding(24, self.real_time_emb_dim)
             # self.minute_embedding = nn.Embedding(60, self.real_time_emb_dim)
@@ -109,9 +106,7 @@ class diff_CSDI(nn.Module):
         x = F.relu(x)
         x = x.reshape(B, self.channels, K, L)
 
-        # 处理时间编码：将day、hour、minute组合成单一索引进行共同编码
         if real_time_embed is not None:
-            # 计算组合索引：day * 24 * 60 + hour * 60 + minute
             # day = real_time_embed[:, 0, :].long()  # (B, L)
             hour = real_time_embed[:, 1, :].long()  # (B, L)
             # minute = real_time_embed[:, 2, :].long()  # (B, L)
@@ -155,8 +150,6 @@ class ResidualBlock(nn.Module):
             self.mid_projection = Conv1d_with_init(channels, 2 * channels, 1)
         self.output_projection = Conv1d_with_init(channels, 2 * channels, 1)
 
-        # 分支融合权重：用于加权和融合 feature 分支和 graph 分支
-        # 使用可学习参数，初始化为 0.5 表示两个分支等权重
         self.branch_weight = nn.Parameter(torch.tensor(0.5))
         # self.branch_weight = 0.5
         self.gate = nn.Linear(channels, 1)

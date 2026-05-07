@@ -29,18 +29,14 @@ def time_shift(time_str, shift):
 
 class gd_diff:
     def __init__(self, configs) -> None:
-        # 处理main.py的配置结构，转换为CSDI需要的格式
         if not isinstance(configs, dict):
-            # 如果是Hydra配置对象，转换为字典
             configs = dict(configs)
         
-        # 添加CSDI需要的字段
         if 'root' not in configs:
             configs['root'] = './'
         if 'config_path' not in configs:
             configs['config_path'] = 'conf/baseline/csdi_UTS.yaml'
         
-        # 确保配置结构完整
         if 'training_config' not in configs:
             configs['training_config'] = configs
         if 'data_config' not in configs:
@@ -52,43 +48,40 @@ class gd_diff:
         if 'all' in configs['data_config']['target_cols']:
             configs = self.preprocess_data(configs)
         self.config = configs
-        # 设置所有随机数种子
         seed = configs['training_config']['seed']
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # 如果使用多GPU
+        torch.cuda.manual_seed_all(seed)
         np.random.seed(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
         self.model = None
 
-        self.mean = None  # 训练集均值
-        self.std = None  # 训练集方差
+        self.mean = None
+        self.std = None
 
-        self.foldername = None  # 结果存储位置
+        self.foldername = None
 
-        self.target_dim = len(configs['data_config']["columns"])  # 预测目标的维度
+        self.target_dim = len(configs['data_config']["columns"])
         self.real_target_dim=len(configs['data_config']["target_cols"])
-        self.device = configs['training_config']["device"]  # 训练设备
+        self.device = configs['training_config']["device"]
 
-        self.dataloader = {"train": None, "valid": None, "test": None}  # 数据加载器
+        self.dataloader = {"train": None, "valid": None, "test": None}
 
-        self.data_info = []  # 存储数据的列名信息，便于复现
-        self.norm_info = []  # 存储各次训练的归一化信息
-        self.data_process = []  # 存储数据处理操作
+        self.data_info = []
+        self.norm_info = []
+        self.data_process = []
 
-        self.roll_run = configs['training_config']["roll_run"]  # 是否要进行滚动训练
-        self.roll_step = configs['training_config']["roll_step"]  # 滚动训练的单次平移长度为多少个unit_step
+        self.roll_run = configs['training_config']["roll_run"]
+        self.roll_step = configs['training_config']["roll_step"]
 
-        self.test_index = None  # 测试集的时间戳
+        self.test_index = None
 
-        # 添加归一化相关参数
-        self.is_non_stationary = configs['data_config']['is_non_stationary']  # 是否进行非平稳序列处理
-        self.non_stationary_type = configs['data_config']['non_stationary_type']  # 归一化类型：0-仅去中心化，1-标准化
-        self.past_len = configs['data_config']["past_len"] * configs['data_config']['unit_len']  # 历史数据长度
+        self.is_non_stationary = configs['data_config']['is_non_stationary']
+        self.non_stationary_type = configs['data_config']['non_stationary_type']
+        self.past_len = configs['data_config']["past_len"] * configs['data_config']['unit_len']
         
-        # 创建文件夹用于存储，文件夹名为 "数据集名字_时间"
         beijing_tz = pytz.timezone("Asia/Shanghai")
         current_time = datetime.now().astimezone(beijing_tz).strftime("%Y-%m-%d_%H:%M:%S")
         foldername = (
@@ -101,7 +94,6 @@ class gd_diff:
         os.makedirs(foldername, exist_ok=True)
         self.foldername = foldername
 
-        # 转存三个配置文件，便于复现
         def copy_file_to_folder(file_path, folder_name):
             file_name = os.path.basename(file_path)
             destination_path = os.path.join(folder_name, file_name)
@@ -110,10 +102,6 @@ class gd_diff:
         copy_file_to_folder(os.path.join(configs['root'], configs['config_path']), self.foldername)
 
     def init_model(self) -> None:
-        """
-        初始化模型，也可以用于建立新的模型
-        """
-        # 直接创建模型，CSDI模型架构会动态修改配置字典
         self.model = Forecasting(self.config, self.device, self.target_dim).to(self.config['training_config']["device"])
 
         def print_model_info(model):
@@ -147,10 +135,6 @@ class gd_diff:
             configs['data_config']['feature_cols_da'] = []
         return configs
     def process_data(self, rolls_step=0) -> None:
-        """数据加载和处理
-        构造特征或构造dataset，在初始化和进行滚动测试时可以使用
-        raw_dataset -> processed_dataset
-        """
         file_path = self.config['data_config']["data_path"]
         if file_path.endswith('.csv'):
             raw_dataset = pd.read_csv(file_path)
@@ -164,16 +148,13 @@ class gd_diff:
         raw_dataset.set_index('timestamp',inplace=True)
         raw_dataset.index = pd.to_datetime(raw_dataset.index)
 
-        # 重新索引原始数据列
         raw_dataset = raw_dataset.reindex(self.config['data_config']['target_cols']+
                                         self.config['data_config']['feature_cols_mask2D']+
                                         self.config['data_config']['feature_cols_mask1D']+
                                         self.config['data_config']['feature_cols_da'], axis=1)
   
-        # 校对数据的列名是否对齐
         config_temp = self.config
 
-        # 滚动测试时调整切割时间戳
         config_temp['data_config']["data_len"]["shift"] = (
             self.config['data_config']["data_len"]["shift"] - rolls_step
         )
@@ -271,20 +252,17 @@ class gd_diff:
             ].index
         elif config_temp['data_config']["data_mode"] == 2:
             processed_dataset = raw_dataset.copy()
-            # 按比例划分训练集、验证集和测试集
             total_len = len(processed_dataset)
             train_ratio, val_ratio, test_ratio = config_temp['data_config']["train_val_test_ratio"]
             train_len = int(total_len * train_ratio)
             val_len = int(total_len * val_ratio)
-            test_len = total_len - train_len - val_len  # 剩余部分作为测试集
+            test_len = total_len - train_len - val_len
 
             train_dataset = processed_dataset.iloc[:train_len]
-            # test_index为测试集的index
             self.test_index = processed_dataset.iloc[train_len+val_len:].index
         elif config_temp['data_config']["data_mode"] == 3:
             train_dataset = processed_dataset.iloc[-config_temp['data_config']["data_len"]["train"]*unit_len:]
             self.test_index = processed_dataset.iloc[-config_temp['data_config']["data_len"]["train"]*unit_len-config_temp['data_config']["data_len"]["valid"]*unit_len-config_temp['data_config']["data_len"]["test"]*unit_len:].index
-        # 进行归一化处理，并且存储归一化值，以便于再次使用模型进行推理
         processed_dataset = self.normalize(train_dataset, processed_dataset)
 
         self.generate_dataloader(processed_dataset, config_temp)
@@ -297,12 +275,10 @@ class gd_diff:
             col_std = np.std(train_dataset.to_numpy(), axis=0, keepdims=True)
             col_std[col_std == 0] = 1
 
-            # 将归一化参数存储到模型中
             self.model.mean = col_mean
             self.model.std = col_std
 
         else:
-            # 如果已经加载好了模型，则直接采用模型本身的均值和方差进行归一化
             col_mean = self.model.mean
             col_std = self.model.std
 
@@ -312,9 +288,6 @@ class gd_diff:
         return (processed_dataset - col_mean) / col_std
 
     def generate_dataloader(self, processed_dataset, config):
-        """
-        生成数据加载器
-        """
         train_dataset = Diffusion_Dataset(config, processed_dataset, "train")
         valid_dataset = Diffusion_Dataset(config, processed_dataset, "valid")
         test_dataset = Diffusion_Dataset(config, processed_dataset, "test")
@@ -334,16 +307,14 @@ class gd_diff:
         )
 
     def train(self) -> None:
-        """训练模型"""
         valid_epoch_interval = 1
 
         for k in range(self.roll_run + 1):
             print(f"-----------第{k}次训练和推理-------------")
 
-            self.init_model()  # 初始化一个新的模型
-            self.process_data(k)  # 处理数据，一般为归一化，可以添加特征工程
+            self.init_model()
+            self.process_data(k)
 
-            # 配置优化器
             config_temp = self.config['training_config']
             optimizer = Adam(
                 self.model.parameters(),
@@ -357,23 +328,22 @@ class gd_diff:
             )
 
             if self.foldername != "":
-                output_path = self.foldername + f"model_{k}.pth"  # 存储最终训练模型
+                output_path = self.foldername + f"model_{k}.pth"
                 best_path = (
                     self.foldername + f"best_model_{k}.pth"
-                )  # 存储验证效果最优对应的模型
-                # 创建 TensorBoard writer
+                )
                 tensorboard_dir = os.path.join(self.foldername, f"tensorboard_run_{k}")
                 os.makedirs(tensorboard_dir, exist_ok=True)
                 writer = SummaryWriter(log_dir=tensorboard_dir)
                 print(f"TensorBoard logs saved to: {tensorboard_dir}")
                 print(f"View with: tensorboard --logdir={tensorboard_dir}")
 
-            train_losses = []  # 存储训练过程的loss
-            valid_losses = []  # 存储验证过程的loss
+            train_losses = []
+            valid_losses = []
 
-            best_valid_loss = 1e10  # 存储最优的验证loss
-            patience = config_temp["patience"]  # 早停耐心值
-            patience_counter = 0  # 早停计数器
+            best_valid_loss = 1e10
+            patience = config_temp["patience"]
+            patience_counter = 0
             for epoch_no in range(config_temp["epochs"]):
                 self.now_epoch_no = epoch_no
                 avg_loss = 0
@@ -383,8 +353,7 @@ class gd_diff:
                     self.dataloader["train"], mininterval=5.0, maxinterval=50.0
                 ) as it:
                     for batch_no, train_batch in enumerate(it, start=1):
-                        optimizer.zero_grad()  # 清除优化器梯度
-                        # 类似nstransformer的归一化处理
+                        optimizer.zero_grad()
                         if self.is_non_stationary:
                             observed_data = train_batch['observed_data']  # [batch_size, seq_len, feature_dim]
                             means = torch.mean(observed_data[:, :self.past_len, :], dim=1, keepdim=True).detach()  # [batch_size, 1, feature_dim]
@@ -399,29 +368,24 @@ class gd_diff:
                             observed_data_normalized = observed_data_normalized / stdev
                             
                             train_batch['observed_data'] = observed_data_normalized                       
-                        # 计算 loss 并进行模型更新
                         loss = self.model(train_batch)
                         
-                        # 检查loss是否为NaN
                         if torch.isnan(loss):
                             print(f"Warning: NaN loss detected at epoch {epoch_no}, batch {batch_no}")
-                            continue  # 跳过这个batch
+                            continue
                         
                         loss.backward()
                         
-                        # # 梯度裁剪，防止梯度爆炸
                         # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         
                         avg_loss += loss.item()
                         optimizer.step()
                         
-                        # 记录到 TensorBoard
                         if self.foldername != "":
                             global_step = epoch_no * len(self.dataloader["train"]) + batch_no
                             writer.add_scalar('Train/BatchLoss', loss.item(), global_step)
                             writer.add_scalar('Train/LearningRate', optimizer.param_groups[0]['lr'], global_step)
                         
-                        # 进度条显示信息
                         it.set_postfix(
                             ordered_dict={
                                 "loss": loss.item(),
@@ -436,7 +400,6 @@ class gd_diff:
                 avg_train_loss = avg_loss / batch_no
                 train_losses.append(avg_train_loss)
                 
-                # 记录训练 epoch loss 到 TensorBoard
                 if self.foldername != "":
                     writer.add_scalar('Train/EpochLoss', avg_train_loss, epoch_no)
                     writer.add_scalar('Train/LearningRate_Epoch', optimizer.param_groups[0]['lr'], epoch_no)
@@ -472,12 +435,10 @@ class gd_diff:
                         self.mean, self.std, target_dim=self.real_target_dim
                     )
 
-                    # 记录验证指标到 TensorBoard
                     if self.foldername != "":
                         writer.add_scalar('Valid/MAE', mae, epoch_no)
                         writer.add_scalar('Valid/RMSE', rmse, epoch_no)
 
-                    # 存储验证效果最好的模型
                     if best_valid_loss > mae:
                         best_valid_loss = mae
                         patience_counter = 0
@@ -493,19 +454,16 @@ class gd_diff:
                     else:
                         patience_counter += 1
 
-                    # TensorBoard: 记录验证指标
                     if self.foldername != "":
                         writer.add_scalar('Valid/MAE', mae, epoch_no)
                         writer.add_scalar('Valid/RMSE', rmse, epoch_no)
 
-                    # 早停判断
                     if patience_counter >= patience:
                         print(f"\nEarly stopping at epoch {epoch_no}, patience={patience} exhausted")
                         break
 
                 valid_losses.append(mae)
             self.load_model(best_path)
-            # 训练完成后进行测试集推理
             output = self.predict(self.dataloader["test"], self.config['model_config']["nsample"])
             self.output_save(output, target_dim=self.real_target_dim)
             (
@@ -603,7 +561,6 @@ class gd_diff:
             print(f"第{k}次测试集Pearson：", pearson)
             print(f"第{k}次测试集SMAPE：", smape)
             
-            # 记录测试集指标到 TensorBoard
             if self.foldername != "":
                 writer.add_scalar('Test/MAE', mae, k)
                 writer.add_scalar('Test/RMSE', rmse, k)
@@ -613,14 +570,11 @@ class gd_diff:
                 writer.add_scalar('Test/Pearson', pearson, k)
                 writer.add_scalar('Test/SMAPE', smape, k)
                 
-                # 记录训练和验证 loss 曲线
-                # 分别记录训练和验证 loss，避免长度不匹配问题
                 for epoch_idx, train_loss in enumerate(train_losses):
                     writer.add_scalar('Loss/Train', train_loss, epoch_idx)
                 for epoch_idx, valid_loss in enumerate(valid_losses):
                     writer.add_scalar('Loss/Valid', valid_loss, epoch_idx)
                 
-                # 如果长度匹配，也记录对比图
                 if len(train_losses) == len(valid_losses):
                     for epoch_idx, (train_loss, valid_loss) in enumerate(zip(train_losses, valid_losses)):
                         writer.add_scalars('Loss/Train_Valid_Comparison', {
@@ -628,23 +582,17 @@ class gd_diff:
                             'Valid': valid_loss
                         }, epoch_idx)
                 
-                # 关闭 TensorBoard writer
                 writer.close()
                 print(f"TensorBoard logs closed for run {k}")
             
-            # 存储单次训练出的模型
             self.save_model(self.model, output_path)
 
-            # 存储 loss 结果
             losses_path = self.foldername + f"losses_{k}.pkl"
             losses_data = {"train_losses": train_losses, "valid_losses": valid_losses}
             with open(losses_path, "wb") as f:
                 pickle.dump(losses_data, f)
 
     def predict(self, dataloader, nsample):
-        """
-        根据给定的数据加载器，使用当前的模型进行批量预测
-        """
 
         with torch.no_grad():
             self.model.eval()
@@ -684,7 +632,6 @@ class gd_diff:
                     observed_points = observed_points.permute(0, 2, 1)
 
                     if self.is_non_stationary:
-                        # 确保means和stdev在与samples相同的设备上
                         means = means.to(samples.device)
                         stdev = stdev.to(samples.device)
                         samples = samples * stdev.unsqueeze(1) + means.unsqueeze(1)
@@ -717,9 +664,6 @@ class gd_diff:
             all_generated_samples,
         )
     def test(self,test=0):
-        """
-        根据给定的数据加载器，使用当前的模型进行批量预测
-        """
         if test==0:
             self.load_model()
         else:
@@ -761,7 +705,6 @@ class gd_diff:
                     eval_points = eval_points.permute(0, 2, 1)
                     observed_points = observed_points.permute(0, 2, 1)
                     if self.is_non_stationary:
-                        # 确保means和stdev在与samples相同的设备上
                         means = means.to(samples.device)
                         stdev = stdev.to(samples.device)
                         samples = samples * stdev.unsqueeze(1) + means.unsqueeze(1)
@@ -794,23 +737,15 @@ class gd_diff:
             all_generated_samples,
         )
     def evaluate(self, metric_func, *data, target_dim=10):
-        """
-        对预测结果进行评测，使用utils.metrics中的指标函数
-        """
-        # 解析输入数据
         all_target, all_evalpoint, all_observed_point, all_observed_time, all_generated_samples = data[:5]
         
-        # 获取归一化参数
         mean = data[5] if len(data) > 5 else self.mean
         std = data[6] if len(data) > 6 else self.std
         
-        # 去归一化
         targets = all_target * std + mean
         samples = all_generated_samples * std + mean
         
-        # 提取预测部分（最后pred_len个时间步）
         pred_length = int(self.config['data_config']["unit_len"] * self.config['data_config']['pred_len'])
-        # 保留第三维的所有数据
         if target_dim == 1:
             targets = targets[:, -pred_length:, 0]
             samples = samples[:, :, -pred_length:, 0]
@@ -818,25 +753,19 @@ class gd_diff:
             targets = targets[:, -pred_length:, :]  # (B, pred_len, K)
             samples = samples[:, :, -pred_length:, :]  # (B, nsample, pred_len, K)
         
-        # 使用中位数作为预测值（第50个百分位数）
-        if samples.shape[1] > 1:  # 如果有多个样本
+        if samples.shape[1] > 1:
             pred_values = torch.quantile(samples, 0.5, dim=1)  # (B, pred_len, K)
         else:
             pred_values = samples.squeeze(1)  # (B, pred_len, K)
         
-        # 确保数据是连续的
         targets = targets.contiguous()
         pred_values = pred_values.contiguous()
         
-        # 调用指标函数
         if metric_func in [MAE_torch, RMSE_torch, MAPE_torch, R2_torch, SPEARMAN_torch, PEARSON_torch, SMAPE_torch]:
-            # 使用PyTorch版本的指标函数
             return metric_func(pred_values, targets)
         elif metric_func in [MAE_np, RMSE_np, MAPE_np, R2_np, SPEARMAN_np, PEARSON_np, SMAPE_np]:
-            # 使用NumPy版本的指标函数
             return metric_func(pred_values.cpu().numpy(), targets.cpu().numpy())
         else:
-            # 兼容原有的指标函数调用方式
             return metric_func(*data)
 
     def valid_test(self, output, target_dim=10):
@@ -871,7 +800,7 @@ class gd_diff:
             samples = np.concatenate(
                 (quantiles[4].reshape(-1)[:, np.newaxis], samples), axis=1
             )
-            pred_values = samples[:, 0]  # 使用中位数预测值
+            pred_values = samples[:, 0]
             mae = MAE_np(pred_values, targets.flatten())
             rmse = RMSE_np(pred_values, targets.flatten())
             r2 = R2_np(pred_values, targets.flatten())
@@ -884,18 +813,14 @@ class gd_diff:
                 f"Sample_{x}" for x in range(self.config['training_config']["valid_nsample"])
             ]
         else:
-            # 多变量情况，分别对每个变量计算quantile和样本
-            # 这里只保存中位数和所有样本
             quantiles = []
             for q in qlist:
                 quantiles.append(torch.quantile(samples, q, dim=1).numpy())  # (B, pred_len, K)
-            # 取中位数
             median_pred = quantiles[4].reshape(-1, target_dim)
             # (B, nsample, pred_len, K) -> (B, pred_len, nsample, K)
             samples = np.transpose(samples, (0, 2, 1, 3))
             # (B*pred_len, nsample, K)
             samples = samples.reshape(-1, self.config['training_config']["valid_nsample"], target_dim)
-            # 拼接中位数和样本
             samples_concat = np.concatenate((median_pred, samples[:, :, 0]), axis=1) if samples.shape[2] == 1 else np.concatenate((median_pred, samples.reshape(-1, self.config['training_config']["valid_nsample"]*target_dim)), axis=1)
             pred_values = median_pred  # (B*pred_len, K)
             mae = MAE_np(pred_values, targets)
@@ -914,10 +839,6 @@ class gd_diff:
         with open(self.foldername + f"valid_results_{self.now_epoch_no}.pkl", 'wb') as file:
             pickle.dump(output_pd, file)
     def output_save(self, output, target_dim=10) -> None:
-        """
-        存储标准的pd格式的预测数据（以及其原始文件，方便更进一步分析）
-        时间 + 预测 + 真值
-        """
         (
             all_target,
             all_evalpoint,
@@ -932,14 +853,11 @@ class gd_diff:
             targets = all_target
             samples = all_generated_samples
 
-        # 判断target_dim，决定保留的维度
         if target_dim == 1:
-            # 单变量情况，保留最后一个预测窗口的第0维
             targets = targets[:, -int(self.config['data_config']["unit_len"] * self.config['data_config']['pred_len']):, 0]
             targets = targets.reshape(-1).unsqueeze(1).numpy()
             samples = samples[:, :, -int(self.config['data_config']["unit_len"] * self.config['data_config']['pred_len']):, 0]
         else:
-            # 多变量情况，保留所有变量
             targets = targets[:, -int(self.config['data_config']["unit_len"] * self.config['data_config']['pred_len']):, :]
             targets = targets.reshape(-1, target_dim).numpy()
             samples = samples[:, :, -int(self.config['data_config']["unit_len"] * self.config['data_config']['pred_len']):, :]
@@ -955,7 +873,7 @@ class gd_diff:
             samples = np.concatenate(
                 (quantiles[4].reshape(-1)[:, np.newaxis], samples), axis=1
             )
-            pred_values = samples[:, 0]  # 使用中位数预测值
+            pred_values = samples[:, 0]
             mae = MAE_np(pred_values, targets.flatten())
             rmse = RMSE_np(pred_values, targets.flatten())
             smape = SMAPE_np(pred_values, targets.flatten())
@@ -969,7 +887,6 @@ class gd_diff:
                 f"Sample_{x}" for x in range(self.config['model_config']["nsample"])
             ]
         else:
-            # 多变量
             nsample = self.config['model_config']["nsample"]
             K = samples.shape[-1]
             for q in qlist:
@@ -978,9 +895,7 @@ class gd_diff:
             samples = samples.reshape(-1, nsample, K)  # (B*L, nsample, K)
             quantile_mid = quantiles[4].reshape(-1, K)  # (B*L, K)
             samples_np = samples  # (B*L, nsample, K)
-            # 拼接中位数
             samples_concat = np.concatenate((quantile_mid[:, np.newaxis, :], samples_np), axis=1)  # (B*L, nsample+1, K)
-            # 展平成二维
             samples_concat = samples_concat.reshape(-1, (nsample + 1) * K)
             pred_values = quantile_mid  # (B*L, K)
             mae = MAE_np(pred_values, targets)
@@ -992,7 +907,6 @@ class gd_diff:
             print(f"测试集MAE: {mae}, RMSE: {rmse}")
 
             datas = np.concatenate((targets, samples_concat), axis=1)
-            # 构建列名
             cols = [f"Real_{i}" for i in range(K)] + \
                    [f"Prediction_{i}" for i in range(K)] + \
                    [f"Sample_{x}_{i}" for x in range(nsample) for i in range(K)]
@@ -1003,7 +917,6 @@ class gd_diff:
         with open(self.foldername + "results.pkl", 'wb') as file:
             pickle.dump(output_pd, file)
 
-        # 存储原始数据
         with open(
             self.foldername
             + "raw_results_nsample"
@@ -1025,9 +938,6 @@ class gd_diff:
             )
 
     def save_model(self, model, save_path) -> None:
-        """
-        保存模型参数和归一化参数
-        """
         mean = self.mean
         std = self.std
         param = {
@@ -1038,12 +948,8 @@ class gd_diff:
         torch.save(param, save_path)
 
     def load_model(self, best_model_path=None) -> None:
-        """
-        加载模型参数
-        """
         model_path = self.config['training_config']["model_path"]
         
-        # 如果提供了best_model_path，说明是训练结束后加载最优模型
         if best_model_path is not None:
             model_path = best_model_path
             print(f"训练结束，加载最优模型: {model_path}")
