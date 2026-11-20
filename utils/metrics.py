@@ -3,6 +3,18 @@ import torch
 from scipy.stats import pearsonr, spearmanr
 
 
+def fair_ensemble_crps(samples, targets):
+    """Per-target fair CRPS for equally weighted draws along dimension 1."""
+    n = samples.size(1)
+    if n < 2:
+        raise ValueError("Fair ensemble CRPS requires at least two draws.")
+    ordered = samples.sort(dim=1).values
+    ranks = torch.arange(1, n + 1, device=samples.device, dtype=samples.dtype)
+    weights = (2 * ranks - n - 1).reshape(1, n, *([1] * (samples.ndim - 2)))
+    dispersion = (ordered * weights).sum(dim=1) / (n * (n - 1))
+    return (samples - targets.unsqueeze(1)).abs().mean(dim=1) - dispersion
+
+
 def MAE_torch(pred, true, mask_value=None):
     if mask_value is not None:
         mask = torch.gt(true, mask_value)

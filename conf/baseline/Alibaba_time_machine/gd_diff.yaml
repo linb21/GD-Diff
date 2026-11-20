@@ -5,7 +5,7 @@ seed: 2024
 training_config:
   seed: 2024
   device: cuda:0
-  mode: pred
+  mode: train
   save_path: ./experiments/gd_diff/
   model_path: ""
   valid_nsample: 3
@@ -60,6 +60,11 @@ model_config:
 
   graph:
     graph_type: 'time'
+    graph_freq: minute
+    reference_time: "2018-01-01 00:00:00"
+    graph_interval: 60
     num_nodes: 100
     embed_dim: 16
     top_k: 10
+    
+    

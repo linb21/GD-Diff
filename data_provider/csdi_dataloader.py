@@ -1,7 +1,7 @@
 import glob
 import os
 from datetime import datetime
-
+import re
 import numpy as np
 import pandas as pd
 import torch
@@ -74,7 +74,10 @@ class Diffusion_Dataset(Dataset):
             if not self.graph_dir:
                 raise ValueError("graph_dir is required when graph_type=time.")
             graph_pattern = os.path.join(self.graph_dir, "adjacency_matrix_*.npy")
-            graph_files = sorted(glob.glob(graph_pattern))
+            graph_files = sorted(
+                glob.glob(graph_pattern),
+                key=lambda p: int(re.search(r'(\d+)\.npy$', os.path.basename(p)).group(1)),
+            )
             if not graph_files:
                 raise ValueError(f"No graph files found under {self.graph_dir}.")
             return [torch.from_numpy(np.load(path)).float() for path in graph_files]

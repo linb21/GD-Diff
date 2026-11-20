@@ -5,7 +5,7 @@ seed: 2024
 training_config:
   seed: 2024
   device: cuda:0
-  mode: pred
+  mode: train
   save_path: ./experiments/gd_diff/
   model_path: ""
   valid_nsample: 3
@@ -20,7 +20,7 @@ training_config:
   inverse: true
 
 data_config:
-  is_non_stationary: true
+  is_non_stationary: False
   non_stationary_type: 1
   data_path: ./data/GoogleCluster/cpus_avg_100machines_5min.parquet
   graph_dir: ./data/GoogleCluster/interval_graph/
@@ -41,7 +41,7 @@ model_config:
   real_time_emb: 1
 
   diffusion:
-    layers: 5
+    layers: 4
     channels: 64
     nheads: 8
     diffusion_embedding_dim: 128
@@ -64,4 +64,4 @@ model_config:
     graph_interval: 300
     num_nodes: 100
     embed_dim: 16
-    top_k: 10
+    top_k: 15

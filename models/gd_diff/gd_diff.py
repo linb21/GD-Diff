@@ -15,6 +15,7 @@ from tqdm import tqdm
 from data_provider.csdi_dataloader import Diffusion_Dataset
 from models.gd_diff.csdi_model_architecture import Forecasting
 from utils.metrics import (
+    fair_ensemble_crps,
     MAE_np,
     MAE_torch,
     MAPE_np,
@@ -219,7 +220,7 @@ class gd_diff:
 
         train_losses = []
         valid_losses = []
-        best_valid_loss = float("inf")
+        best_valid_mae = float("inf")
         patience = cfg["patience"]
         patience_counter = 0
 
@@ -250,12 +251,12 @@ class gd_diff:
             train_losses.append(avg_train_loss)
             writer.add_scalar("train/epoch_loss", avg_train_loss, epoch_no)
 
-            valid_loss = self.validate()
-            valid_losses.append(valid_loss)
-            writer.add_scalar("valid/loss", valid_loss, epoch_no)
+            valid_mae = self.validate()
+            valid_losses.append(valid_mae)
+            writer.add_scalar("valid/mae", valid_mae, epoch_no)
 
-            if valid_loss < best_valid_loss:
-                best_valid_loss = valid_loss
+            if valid_mae < best_valid_mae:
+                best_valid_mae = valid_mae
                 patience_counter = 0
                 self.save_model(self.model, best_path)
             else:
@@ -271,19 +272,24 @@ class gd_diff:
             pickle.dump({"train_losses": train_losses, "valid_losses": valid_losses}, file_obj)
 
         self.load_model(best_path)
-        self.test(test=1)
-
+        # self.test(test=1)
+            # 训练完成后进行测试集推理
+        output = self.predict(self.dataloader["test"], self.config['model_config']["nsample"])
+        self._report_test_results(output)
+    def _report_test_results(self, output):
+        metrics = self._compute_metrics(output, target_dim=self.real_target_dim)
+        self.output_save(output, target_dim=self.real_target_dim)
+        for name, value in metrics.items():
+            print(f"Test {name.upper()}: {value:.6f}")
     def validate(self):
-        self.model.eval()
-        total_loss = 0.0
-
-        with torch.no_grad():
-            for valid_batch in self.dataloader["valid"]:
-                self._normalize_batch_for_non_stationary(valid_batch)
-                loss = self.model(valid_batch, is_train=0)
-                total_loss += loss.item()
-
-        return total_loss / max(len(self.dataloader["valid"]), 1)
+        output = self.predict(
+            self.dataloader["valid"],
+            self.config["training_config"]["valid_nsample"],
+        )
+        return self.evaluate(
+            MAE_torch, *output, self.mean, self.std,
+            target_dim=self.real_target_dim,
+        ).item()
 
     def predict(self, dataloader, nsample):
         self.model.eval()
@@ -326,20 +332,12 @@ class gd_diff:
         if test == 0:
             self.load_model()
         else:
+            # path for trained model
             self.load_model(self.config["training_config"]["model_path"])
 
         self.process_data()
         output = self.predict(self.dataloader["test"], self.config["model_config"]["nsample"])
-        metrics = self._compute_metrics(output, target_dim=self.real_target_dim)
-        self.output_save(output, target_dim=self.real_target_dim)
-
-        print(f"Test MAE: {metrics['mae']}")
-        print(f"Test RMSE: {metrics['rmse']}")
-        print(f"Test MAPE: {metrics['mape']}")
-        print(f"Test R2: {metrics['r2']}")
-        print(f"Test Spearman: {metrics['spearman']}")
-        print(f"Test Pearson: {metrics['pearson']}")
-        print(f"Test SMAPE: {metrics['smape']}")
+        self._report_test_results(output)
         return output
 
     def _compute_metrics(self, output, target_dim):
@@ -402,7 +400,14 @@ class gd_diff:
         cols += [f"Sample_{sample_idx}_{dim_idx}" for sample_idx in range(nsample) for dim_idx in range(target_dim)]
 
         output_pd = pd.DataFrame(datas, columns=cols)
-        output_pd = pd.concat((pd.DataFrame(self.test_index, columns=["timestamp"]), output_pd), axis=1)
+        test_dataset = self.dataloader["test"].dataset
+        forecast_positions = (
+            test_dataset.use_index[:, None]
+            + test_dataset.past_length
+            + np.arange(test_dataset.pred_length)
+        )
+        timestamps = test_dataset.index.take(forecast_positions.ravel())
+        output_pd.insert(0, "timestamp", timestamps)
         with open(os.path.join(self.foldername, "results.pkl"), "wb") as file_obj:
             pickle.dump(output_pd, file_obj)
 
